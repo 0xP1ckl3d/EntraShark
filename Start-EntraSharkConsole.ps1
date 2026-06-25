@@ -962,13 +962,42 @@ $refreshJob = {
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
         $vault | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $TokenVaultPath -Encoding UTF8
     }
+    function SetVaultTokenVariable([string]$Name, $Value) {
+        if (-not $Name) { return }
+        Set-Variable -Name $Name -Scope 1 -Value $Value
+        Set-Variable -Name $Name -Scope Global -Value $Value
+    }
+    function ClearTokenVariable([string]$Name) {
+        if (-not $Name) { return }
+        Remove-Variable -Name $Name -Scope 1 -ErrorAction SilentlyContinue
+        Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+    }
+    function GetTokenVariable([string]$Name) {
+        $v = Get-Variable -Name $Name -Scope 1 -ValueOnly -ErrorAction SilentlyContinue
+        if ($v) { return $v }
+        return (Get-Variable -Name $Name -Scope Global -ValueOnly -ErrorAction SilentlyContinue)
+    }
+    function ResolveInputVarFromVault($Vault, [string]$Requested) {
+        if ($Vault.Contains($Requested)) { return $Requested }
+        if ($Requested -eq 'tokens' -and $Vault.Contains('graphTokens')) { return 'graphTokens' }
+        foreach ($candidate in @('tokens','graphTokens','aadGraphTokens','armTokens')) {
+            if ($Vault.Contains($candidate)) { return $candidate }
+        }
+        return $Requested
+    }
     $Task.state='running'; $Task.started=(Get-Date).ToString('o'); $Task.message='Refreshing tokens'; SaveTask $Task
     try {
         $vault = ReadVault
         $inputVar = if ($Refresh.inputVar) { [string]$Refresh.inputVar } else { 'tokens' }
-        if (-not $vault.Contains($inputVar)) { throw "Source token variable $inputVar not found. Acquire or load that token first." }
-        Set-Variable -Name $inputVar -Scope Global -Value $vault[$inputVar]
         . $ToolPath
+        foreach ($key in @($vault.Keys)) { SetVaultTokenVariable -Name $key -Value $vault[$key] }
+        $resolvedInputVar = ResolveInputVarFromVault -Vault $vault -Requested $inputVar
+        if (-not $vault.Contains($resolvedInputVar)) { throw "Source token variable $inputVar not found in current run token vault. Acquire or load that token first." }
+        if ($resolvedInputVar -ne $inputVar) {
+            Log "Input variable $inputVar was not in the run token vault; using $resolvedInputVar from this run instead."
+            $inputVar = $resolvedInputVar
+        }
+        SetVaultTokenVariable -Name $inputVar -Value $vault[$inputVar]
         $baseParams = @{ InputVar=$inputVar; Quiet=$true }
         if ($Refresh.tenantId) { $baseParams.TenantId = [string]$Refresh.tenantId }
         if ($Refresh.clientId) { $baseParams.ClientId = [string]$Refresh.clientId }
@@ -986,6 +1015,7 @@ $refreshJob = {
             $params = $baseParams.Clone()
             $params.Resource = [string]$resource
             $params.OutVar = [string]$outVar
+            ClearTokenVariable -Name $outVar
             $resolvedResource = $resource
             $resourceKey = "$resource".ToLowerInvariant()
             if ($script:ResourceAliases -and $script:ResourceAliases.Contains($resourceKey)) { $resolvedResource = $script:ResourceAliases[$resourceKey] }
@@ -996,20 +1026,28 @@ $refreshJob = {
             $streamOutput = @(Invoke-RefreshTokens @params *>&1)
             if ($script:RefreshHostBuffer.Trim()) { Log $script:RefreshHostBuffer; $script:RefreshHostBuffer = '' }
             AppendStreamLog '' $streamOutput
-            $vault[$outVar] = Get-Variable -Name $outVar -Scope Global -ValueOnly -ErrorAction Stop
+            $newToken = GetTokenVariable -Name $outVar
+            if (-not $newToken -or -not $newToken.access_token) { throw "Refresh helper did not produce `$${outVar}. Check the task log for helper errors." }
+            $vault[$outVar] = $newToken
         } else {
             Log 'Running refresh sweep'
             $params = $baseParams.Clone()
             $params.Sweep = $true
+            foreach ($name in @('graphTokens','aadGraphTokens','armTokens','outlookTokens','teamsTokens','officeAppsTokens','officeMgmtTokens','vaultTokens','storageTokens','powerbiTokens','flowTokens','fabricTokens','defenderTokens','intuneTokens','mamTokens','yammerTokens','sqlTokens','devopsTokens')) {
+                ClearTokenVariable -Name $name
+            }
+            SetVaultTokenVariable -Name $inputVar -Value $vault[$inputVar]
             if ($Refresh.onlyAudiences) { $params.OnlyAudiences = @([string]$Refresh.onlyAudiences -split '[,\s]+' | Where-Object { $_ }) }
             if ($Refresh.skipAudiences) { $params.SkipAudiences = @([string]$Refresh.skipAudiences -split '[,\s]+' | Where-Object { $_ }) }
             $streamOutput = @(Invoke-RefreshTokens @params *>&1)
             if ($script:RefreshHostBuffer.Trim()) { Log $script:RefreshHostBuffer; $script:RefreshHostBuffer = '' }
             AppendStreamLog '' $streamOutput
+            $produced = 0
             foreach ($name in @('graphTokens','aadGraphTokens','armTokens','outlookTokens','teamsTokens','officeAppsTokens','officeMgmtTokens','vaultTokens','storageTokens','powerbiTokens','flowTokens','fabricTokens','defenderTokens','intuneTokens','mamTokens','yammerTokens','sqlTokens','devopsTokens')) {
-                $v = Get-Variable -Name $name -Scope Global -ValueOnly -ErrorAction SilentlyContinue
-                if ($v) { $vault[$name] = $v }
+                $v = GetTokenVariable -Name $name
+                if ($v -and $v.access_token) { $vault[$name] = $v; $produced++ }
             }
+            if ($produced -eq 0) { throw 'Refresh sweep did not produce any tokens. Check the task log for helper errors.' }
         }
         SaveVault $vault
         $Task.state='completed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Refresh complete'; $Task.result=[ordered]@{ tokenNames=@($vault.Keys) }; SaveTask $Task
