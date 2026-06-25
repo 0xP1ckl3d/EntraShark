@@ -10,7 +10,9 @@
     FunctionsToExport = @(
         'Invoke-EntraShark',
         'Get-EntraSharkToken',
-        'Invoke-EntraSharkTokenSweep'
+        'Invoke-EntraSharkTokenSweep',
+        'Merge-EntraSharkRunArtifactSet',
+        'New-EntraSharkEvidenceReport'
     )
     CmdletsToExport   = @()
     VariablesToExport = '*'

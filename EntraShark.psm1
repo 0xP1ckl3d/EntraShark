@@ -703,6 +703,239 @@ function Export-EntraSharkCsv {
     return $path
 }
 
+function Import-EntraSharkCsvSafe {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
+    try { return @(Import-Csv -LiteralPath $Path) } catch { return @() }
+}
+
+function Backup-EntraSharkRunFile {
+    param([string]$Run, [string]$Path, [string]$Kind = 'evidence')
+    if (-not $Run -or -not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $name = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $ext = [IO.Path]::GetExtension($Path)
+    $history = Join-Path (Join-Path $Run 'history') (Join-Path $Kind $name)
+    New-Item -ItemType Directory -Force -Path $history | Out-Null
+    $backup = Join-Path $history "$stamp$ext"
+    Copy-Item -LiteralPath $Path -Destination $backup -Force
+    return $backup
+}
+
+function Test-EntraSharkMarkerRows {
+    param([object[]]$Rows)
+    if (@($Rows).Count -ne 1) { return $false }
+    $row = @($Rows)[0]
+    if (-not $row) { return $false }
+    $names = @($row.PSObject.Properties.Name)
+    return ($names -contains 'status' -and $names -contains 'detail' -and $names -contains 'collectedAt' -and
+        ([string]$row.status) -in @('not-returned','failed','empty','denied'))
+}
+
+function Add-EntraSharkCollectionError {
+    param(
+        [string]$Run,
+        [string]$Dataset,
+        [object]$Marker,
+        [string]$SourceFile
+    )
+    $evidence = Join-Path $Run 'evidence'
+    New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+    $path = Join-Path $evidence 'collection-errors.csv'
+    $row = [pscustomobject]@{
+        dataset = $Dataset
+        status = Get-EntraSharkProperty -InputObject $Marker -Name 'status'
+        detail = Get-EntraSharkProperty -InputObject $Marker -Name 'detail'
+        collectedAt = Get-EntraSharkProperty -InputObject $Marker -Name 'collectedAt'
+        sourceFile = $SourceFile
+        recordedAt = (Get-Date).ToString('o')
+    }
+    $rows = @()
+    if (Test-Path -LiteralPath $path) { $rows += @(Import-EntraSharkCsvSafe -Path $path) }
+    $rows += $row
+    @($rows) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+    return $path
+}
+
+function Merge-EntraSharkCsvFile {
+    param(
+        [string]$Run,
+        [string]$Source,
+        [string]$Destination
+    )
+    $name = [IO.Path]::GetFileNameWithoutExtension($Source)
+    $sourceRows = @(Import-EntraSharkCsvSafe -Path $Source)
+    $destRows = @(Import-EntraSharkCsvSafe -Path $Destination)
+    $destinationExists = Test-Path -LiteralPath $Destination
+
+    if ((Test-EntraSharkMarkerRows -Rows $sourceRows) -and $destinationExists) {
+        Add-EntraSharkCollectionError -Run $Run -Dataset $name -Marker $sourceRows[0] -SourceFile $Source | Out-Null
+        return [pscustomobject]@{ dataset=$name; action='preserved-existing-marker-recorded'; rows=$destRows.Count; path=$Destination }
+    }
+
+    switch ($name) {
+        'api-calls' {
+            $merged = @($destRows + $sourceRows)
+            @($merged) | Export-Csv -LiteralPath $Destination -NoTypeInformation -Encoding UTF8
+            return [pscustomobject]@{ dataset=$name; action='appended'; rows=$merged.Count; path=$Destination }
+        }
+        'findings' {
+            $merged = @($destRows + $sourceRows)
+            if ($merged.Count -gt 0) {
+                $merged = @($merged | Group-Object id,title | ForEach-Object { $_.Group | Select-Object -Last 1 })
+            }
+            @($merged) | Export-Csv -LiteralPath $Destination -NoTypeInformation -Encoding UTF8
+            return [pscustomobject]@{ dataset=$name; action='merged'; rows=$merged.Count; path=$Destination }
+        }
+        'graph-nodes' {
+            $merged = @($destRows + $sourceRows)
+            if ($merged.Count -gt 0) {
+                $merged = @($merged | Group-Object id,type | ForEach-Object { $_.Group | Select-Object -Last 1 })
+            }
+            @($merged) | Export-Csv -LiteralPath $Destination -NoTypeInformation -Encoding UTF8
+            return [pscustomobject]@{ dataset=$name; action='merged'; rows=$merged.Count; path=$Destination }
+        }
+        'graph-edges' {
+            $merged = @($destRows + $sourceRows)
+            if ($merged.Count -gt 0) {
+                $merged = @($merged | Group-Object fromId,toId,type | ForEach-Object { $_.Group | Select-Object -Last 1 })
+            }
+            @($merged) | Export-Csv -LiteralPath $Destination -NoTypeInformation -Encoding UTF8
+            return [pscustomobject]@{ dataset=$name; action='merged'; rows=$merged.Count; path=$Destination }
+        }
+        default {
+            $backup = if ($destinationExists) { Backup-EntraSharkRunFile -Run $Run -Path $Destination -Kind 'evidence' } else { $null }
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force
+            return [pscustomobject]@{ dataset=$name; action=($(if ($backup) { 'replaced-with-history' } else { 'created' })); rows=$sourceRows.Count; path=$Destination; backup=$backup }
+        }
+    }
+}
+
+function MergeJsonMap($Target, $Source) {
+    if (-not $Source) { return }
+    foreach ($p in $Source.PSObject.Properties) {
+        if ($Target.PSObject.Properties[$p.Name]) {
+            $Target.PSObject.Properties[$p.Name].Value = $p.Value
+        } else {
+            $Target | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value
+        }
+    }
+}
+
+function Merge-EntraSharkRunDatabase {
+    param([string]$TargetRun, [string]$TempRun)
+    $srcPath = Join-Path $TempRun 'run-db.json'
+    if (-not (Test-Path -LiteralPath $srcPath)) { return $false }
+    $dstPath = Join-Path $TargetRun 'run-db.json'
+    if (-not (Test-Path -LiteralPath $dstPath)) {
+        Copy-Item -LiteralPath $srcPath -Destination $dstPath -Force
+        return $true
+    }
+    Backup-EntraSharkRunFile -Run $TargetRun -Path $dstPath -Kind 'run-db' | Out-Null
+    $dst = Get-Content -LiteralPath $dstPath -Raw | ConvertFrom-Json
+    $src = Get-Content -LiteralPath $srcPath -Raw | ConvertFrom-Json
+    foreach ($map in @('entitiesById','relationsByKey','directoryRoleDefinitionsById','armRoleDefinitionsById','unresolvedIds','datasets')) {
+        if (-not $dst.PSObject.Properties[$map]) { $dst | Add-Member -NotePropertyName $map -NotePropertyValue ([pscustomobject]@{}) }
+        if ($src.PSObject.Properties[$map]) { MergeJsonMap $dst.$map $src.$map }
+    }
+    $dst | ConvertTo-Json -Depth 80 | Set-Content -LiteralPath $dstPath -Encoding UTF8
+    return $true
+}
+
+function New-EntraSharkEvidenceReport {
+    param([Parameter(Mandatory)][string]$Run)
+
+    $resolved = (Resolve-Path -LiteralPath $Run -ErrorAction Stop).Path
+    $evidenceDir = Join-Path $resolved 'evidence'
+    $report = Join-Path $resolved 'report.html'
+    $tabs = @()
+    if (Test-Path -LiteralPath $evidenceDir) {
+        foreach ($csv in @(Get-ChildItem -LiteralPath $evidenceDir -Filter '*.csv' -File | Sort-Object Name)) {
+            $rows = @(Import-EntraSharkCsvSafe -Path $csv.FullName)
+            $tabs += [pscustomobject]@{
+                name = [IO.Path]::GetFileNameWithoutExtension($csv.Name)
+                file = $csv.Name
+                rows = @($rows | Select-Object -First 1000)
+                totalRows = $rows.Count
+            }
+        }
+    }
+    $json = ($tabs | ConvertTo-Json -Depth 60 -Compress)
+    $safeJson = [System.Net.WebUtility]::HtmlEncode($json)
+    $safeRun = [System.Net.WebUtility]::HtmlEncode($resolved)
+    $html = @"
+<!doctype html><html><head><meta charset="utf-8"><title>EntraShark Report</title>
+<style>body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#18202a}header{background:#0c2038;color:white;padding:22px 32px}main{padding:20px}.tabs{display:flex;gap:6px;flex-wrap:wrap}.tabs button{border:1px solid #cbd5e1;background:white;border-radius:6px;padding:7px 10px}.tabs button.active{background:#0c4a75;color:white}.table-wrap{margin-top:12px;overflow:auto;max-height:760px;border:1px solid #dce3ee;background:white}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #e5e7eb;padding:7px 9px;text-align:left;vertical-align:top;max-width:420px;overflow-wrap:anywhere}th{position:sticky;top:0;background:#f8fafc}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px;width:min(560px,100%);margin-top:12px}.meta{color:#475569;font-size:12px;margin-top:4px}</style></head>
+<body><header><h1>EntraShark Report</h1><div>Run: $safeRun</div><div class="meta">Regenerated: $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('o')))</div></header><main><div id="tabs" class="tabs"></div><input id="filter" placeholder="Filter current table"><div class="table-wrap"><table id="tbl"></table></div></main>
+<script id="data" type="application/json">$safeJson</script><script>
+const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur=tabs[0]?.name||'';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function cell(v){const t=String(v??'');return /^https?:\/\//i.test(t)?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t)+'">'+esc(t)+'</a>':esc(t)}function renderTabs(){document.getElementById('tabs').innerHTML=tabs.map(t=>'<button class="'+(t.name===cur?'active':'')+'" onclick="cur=\''+esc(t.name)+'\';renderTabs();render()">'+esc(t.name)+' ('+(t.totalRows??0)+')</button>').join('')}function render(){const data=tabs.find(t=>t.name===cur)||{rows:[],totalRows:0};const term=(document.getElementById('filter').value||'').toLowerCase();const rows=term?data.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):data.rows;const cols=[];rows.forEach(r=>Object.keys(r||{}).forEach(k=>{if(!cols.includes(k))cols.push(k)}));document.getElementById('tbl').innerHTML=cols.length?'<caption style="text-align:left;padding:8px;font-weight:600">'+esc(cur)+' - showing '+rows.length+' of '+(data.totalRows??rows.length)+' row(s)</caption><thead><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody>':'<tbody><tr><td>No rows</td></tr></tbody>'}document.getElementById('filter').addEventListener('input',render);renderTabs();render();
+</script></body></html>
+"@
+    $html | Set-Content -LiteralPath $report -Encoding UTF8
+    return [pscustomobject]@{ Report = $report; TableCount = $tabs.Count; RowCount = (@($tabs | ForEach-Object { $_.totalRows }) | Measure-Object -Sum).Sum }
+}
+
+function Merge-EntraSharkRunArtifactSet {
+    param(
+        [Parameter(Mandatory)][string]$TargetRun,
+        [Parameter(Mandatory)][string]$TempRun,
+        [string]$RequestedDataset
+    )
+
+    $target = (Resolve-Path -LiteralPath $TargetRun -ErrorAction Stop).Path
+    $temp = (Resolve-Path -LiteralPath $TempRun -ErrorAction Stop).Path
+    foreach ($child in @('raw','evidence','history')) { New-Item -ItemType Directory -Force -Path (Join-Path $target $child) | Out-Null }
+    $results = New-Object System.Collections.Generic.List[object]
+    $tempEvidence = Join-Path $temp 'evidence'
+    if (Test-Path -LiteralPath $tempEvidence) {
+        foreach ($csv in @(Get-ChildItem -LiteralPath $tempEvidence -Filter '*.csv' -File | Sort-Object Name)) {
+            $dest = Join-Path (Join-Path $target 'evidence') $csv.Name
+            $results.Add((Merge-EntraSharkCsvFile -Run $target -Source $csv.FullName -Destination $dest)) | Out-Null
+        }
+    }
+
+    foreach ($rootName in @('api-calls.csv','findings.csv','graph-nodes.csv','graph-edges.csv')) {
+        $sourceRoot = Join-Path $temp $rootName
+        if (Test-Path -LiteralPath $sourceRoot) {
+            $destRoot = Join-Path $target $rootName
+            $results.Add((Merge-EntraSharkCsvFile -Run $target -Source $sourceRoot -Destination $destRoot)) | Out-Null
+        }
+    }
+
+    $tempRaw = Join-Path $temp 'raw'
+    if (Test-Path -LiteralPath $tempRaw) {
+        foreach ($raw in @(Get-ChildItem -LiteralPath $tempRaw -File)) {
+            $dest = Join-Path (Join-Path $target 'raw') $raw.Name
+            if (Test-Path -LiteralPath $dest) { Backup-EntraSharkRunFile -Run $target -Path $dest -Kind 'raw' | Out-Null }
+            Copy-Item -LiteralPath $raw.FullName -Destination $dest -Force
+        }
+    }
+
+    foreach ($rootName in @('summary.json')) {
+        $sourceRoot = Join-Path $temp $rootName
+        if (Test-Path -LiteralPath $sourceRoot) {
+            $destRoot = Join-Path $target $rootName
+            if (Test-Path -LiteralPath $destRoot) { Backup-EntraSharkRunFile -Run $target -Path $destRoot -Kind 'root' | Out-Null }
+            Copy-Item -LiteralPath $sourceRoot -Destination $destRoot -Force
+        }
+    }
+
+    Merge-EntraSharkRunDatabase -TargetRun $target -TempRun $temp | Out-Null
+    if ($RequestedDataset) {
+        $requestedCsv = Join-Path (Join-Path $target 'evidence') "$RequestedDataset.csv"
+        $hasRequested = Test-Path -LiteralPath $requestedCsv
+        if (-not $hasRequested) {
+            Add-EntraSharkCollectionError -Run $target -Dataset $RequestedDataset -Marker ([pscustomobject]@{
+                status = 'not-returned'
+                detail = "The module completed but did not produce $RequestedDataset.csv. Check api-calls.csv and collection-errors.csv."
+                collectedAt = (Get-Date).ToString('o')
+            }) -SourceFile $temp | Out-Null
+        }
+    }
+    $report = New-EntraSharkEvidenceReport -Run $target
+    return [pscustomobject]@{ TargetRun=$target; TempRun=$temp; MergedEvidenceFiles=$results.Count; EvidenceResults=@($results.ToArray()); Report=$report.Report; TableCount=$report.TableCount; RowCount=$report.RowCount }
+}
+
 function Invoke-EntraSharkTenantModule {
     param([object]$State)
 
@@ -1485,19 +1718,53 @@ function Invoke-EntraSharkConditionalAccessModule {
 
     $policies = Invoke-EntraSharkGraph -State $State -Module $module -Path '/identity/conditionalAccess/policies' -Query @{ '$top' = 999 } -Paged
     $locations = Invoke-EntraSharkGraph -State $State -Module $module -Path '/identity/conditionalAccess/namedLocations' -Query @{ '$top' = 999 } -Paged
+    $legacyPolicies = @()
+    $legacySource = $null
+
+    if (-not $policies.Success) {
+        $aadToken = Get-EntraSharkToken -VariableName 'aadGraphTokens'
+        if ($aadToken) {
+            Write-EntraSharkStatus -State $State -Message 'Microsoft Graph Conditional Access read failed; trying Azure AD Graph legacy policy endpoint with aadGraphTokens.' -Color Yellow
+            $tenantSegment = if ($State.TenantId) { $State.TenantId } else { 'myorganization' }
+            $legacyUri = "https://graph.windows.net/$tenantSegment/policies?api-version=1.61-internal"
+            $legacy = Invoke-EntraSharkRest -State $State -Module $module -Uri $legacyUri -AccessToken $aadToken.AccessToken -Paged
+            if ($legacy.Success) {
+                $legacySource = $legacyUri
+                $legacyPolicies = @($legacy.Items | Where-Object {
+                    $text = ($_ | ConvertTo-Json -Depth 20 -Compress)
+                    $text -match 'conditionalAccess|Conditional Access|policyType'
+                })
+                if ($legacyPolicies.Count -eq 0) { $legacyPolicies = @($legacy.Items) }
+                $policies = [pscustomobject]@{
+                    Success = $true
+                    Items = $legacyPolicies
+                    Value = $legacy.Value
+                    Error = $null
+                    StatusCode = $legacy.StatusCode
+                    Uri = $legacy.Uri
+                }
+            }
+        }
+    }
 
     $result = [pscustomobject]@{
         policies       = $policies.Items
         namedLocations = $locations.Items
-        access         = @{ policies = $policies.Success; namedLocations = $locations.Success }
+        access         = @{ policies = $policies.Success; namedLocations = $locations.Success; legacyPolicyFallback = [bool]$legacySource }
+        legacyPolicySource = $legacySource
     }
 
     $State.Modules[$module] = $result
     Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
-    Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows ($policies.Items | Select-Object id,displayName,state,createdDateTime,modifiedDateTime) | Out-Null
+    if ($legacySource) {
+        Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows ($policies.Items | Select-Object objectId,id,displayName,state,policyType,createdDateTime,modifiedDateTime) | Out-Null
+    } else {
+        Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows ($policies.Items | Select-Object id,displayName,state,createdDateTime,modifiedDateTime) | Out-Null
+    }
 
     if ($policies.Success) {
-        Add-EntraSharkFinding -State $State -Id 'ES-CA-001' -Severity 'Medium' -Category 'Conditional Access' -Title 'Conditional Access policies are readable' -Description 'The token can read Conditional Access policy names and settings, which lets an operator map MFA, device, location, and exclusion logic.' -Evidence @{ policyCount = @($policies.Items).Count } -ApiCalls @('GET /v1.0/identity/conditionalAccess/policies') -Remediation 'Ensure only approved roles can read policy detail and monitor policy enumeration.'
+        $apiLabel = if ($legacySource) { 'GET https://graph.windows.net/{tenant}/policies?api-version=1.61-internal' } else { 'GET /v1.0/identity/conditionalAccess/policies' }
+        Add-EntraSharkFinding -State $State -Id 'ES-CA-001' -Severity 'Medium' -Category 'Conditional Access' -Title 'Conditional Access policies are readable' -Description 'The token can read Conditional Access policy names and settings, which lets an operator map MFA, device, location, and exclusion logic.' -Evidence @{ policyCount = @($policies.Items).Count; legacyFallback = [bool]$legacySource } -ApiCalls @($apiLabel) -Remediation 'Ensure only approved roles can read policy detail and monitor policy enumeration.'
     } else {
         Add-EntraSharkFinding -State $State -Id 'ES-CA-000' -Severity 'Positive' -Category 'Conditional Access' -Title 'Conditional Access policy read was blocked' -Description 'The tested token could not read Conditional Access policy configuration.' -Evidence @{ statusCode = $policies.StatusCode; error = $policies.Error } -ApiCalls @('GET /v1.0/identity/conditionalAccess/policies') -Remediation 'Keep policy read access limited to authorised administrators and reviewers.'
     }
@@ -2534,4 +2801,4 @@ function Invoke-EntraShark {
     }
 }
 
-Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep
+Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep, Merge-EntraSharkRunArtifactSet, New-EntraSharkEvidenceReport

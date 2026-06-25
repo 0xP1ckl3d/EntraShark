@@ -983,12 +983,14 @@ $reconJob = {
             Log "Creating run directory: $runDir"
         }
         $statusPath = Join-Path $Task.dir 'status.jsonl'
-        $params = @{ OutputDirectory=$runDir; StatusPath=$statusPath; Quiet=$true; IncludeM365Search=[bool]$Recon.includeM365Search }
+        $tempRun = Join-Path $Task.dir 'isolated-recon'
+        $params = @{ OutputDirectory=$tempRun; StatusPath=$statusPath; Quiet=$true; IncludeM365Search=[bool]$Recon.includeM365Search }
         if ($Recon.tenant) { $params.TenantId = $Recon.tenant }
         if ($Recon.modules -and @($Recon.modules).Count -gt 0) { $params.Modules = [string[]]$Recon.modules }
         $result = Invoke-EntraShark @params
-        $Task.state='completed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Recon complete'; $Task.result=[ordered]@{ outputDirectory=$result.OutputDirectory; findingCount=$result.Findings.Count; report=$result.Exports.HtmlReport; modules=$result.Modules }; SaveTask $Task
-        Log 'Recon complete'
+        $merge = Merge-EntraSharkRunArtifactSet -TargetRun $runDir -TempRun $result.OutputDirectory
+        $Task.state='completed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Recon complete'; $Task.result=[ordered]@{ outputDirectory=$runDir; tempRun=$result.OutputDirectory; findingCount=$result.Findings.Count; report=$merge.Report; modules=$result.Modules; mergedEvidenceFiles=$merge.MergedEvidenceFiles; reportTables=$merge.TableCount; reportRows=$merge.RowCount }; SaveTask $Task
+        Log "Recon complete; merged $($merge.MergedEvidenceFiles) evidence operation(s) into active run and regenerated report"
     } catch {
         $Task.state='failed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Recon failed'; $Task.error=$_.Exception.Message; SaveTask $Task; Log "Recon failed: $($_.Exception.Message)"
     }
@@ -999,6 +1001,32 @@ $attackJob = {
     Import-Module $ModulePath -Force
     function SaveTask($t) { $t | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $t.dir 'task.json') -Encoding UTF8 }
     function Log($msg) { [pscustomobject]@{ timestamp=(Get-Date).ToString('o'); message=$msg } | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $Task.dir 'status.jsonl') -Encoding UTF8 }
+    function BackupRunFile($Path, $Kind='evidence') {
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        $name = [IO.Path]::GetFileNameWithoutExtension($Path)
+        $ext = [IO.Path]::GetExtension($Path)
+        $history = Join-Path (Join-Path $run 'history') (Join-Path $Kind $name)
+        New-Item -ItemType Directory -Force -Path $history | Out-Null
+        $backup = Join-Path $history "$stamp$ext"
+        Copy-Item -LiteralPath $Path -Destination $backup -Force
+        return $backup
+    }
+    function WriteEvidenceCsv($Path, $Rows, [switch]$Append) {
+        $newRows = @($Rows)
+        if ($Append -and (Test-Path -LiteralPath $Path)) {
+            $existing = @(Import-Csv -LiteralPath $Path)
+            @($existing + $newRows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+            return @($existing + $newRows).Count
+        }
+        if (Test-Path -LiteralPath $Path) { BackupRunFile -Path $Path -Kind 'evidence' | Out-Null }
+        @($newRows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+        return $newRows.Count
+    }
+    function WriteRawJson($Path, $Value) {
+        if (Test-Path -LiteralPath $Path) { BackupRunFile -Path $Path -Kind 'raw' | Out-Null }
+        $Value | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $Path -Encoding UTF8
+    }
     function ConvertToCellText($Value) {
         if ($null -eq $Value) { return '' }
         if ($Value -is [string] -or $Value -is [ValueType]) { return [string]$Value }
@@ -1145,7 +1173,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             throw
         }
         $out = Join-Path (Join-Path $run 'raw') $RawName
-        $r | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $out -Encoding UTF8
+        WriteRawJson -Path $out -Value $r
         $hits = New-Object System.Collections.Generic.List[object]
         foreach ($block in @($r.value)) {
             foreach ($container in @($block.hitsContainers)) {
@@ -1174,7 +1202,9 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             }
         }
         $csv = Join-Path (Join-Path $run 'evidence') $CsvName
-        @($hits.ToArray()) | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        $written = WriteEvidenceCsv -Path $csv -Rows @($hits.ToArray()) -Append
+        New-EntraSharkEvidenceReport -Run $run | Out-Null
+        Log "Updated $CsvName with $($hits.Count) new row(s); table now has $written row(s)"
         return [ordered]@{ output=$out; evidence=$csv; resultBlocks=@($r.value).Count; hits=$hits.Count; entityTypes=$EntityTypes; query=$Query }
     }
     function InvokeRecentMail {
@@ -1186,12 +1216,14 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         Log "Extracting most recent $top email message(s)"
         $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" }
         $out = Join-Path (Join-Path $run 'raw') 'email-recent.json'
-        $r | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $out -Encoding UTF8
+        WriteRawJson -Path $out -Value $r
         $rows = foreach($m in @($r.value)){
             [pscustomobject]@{ subject=$m.subject; from=$m.from.emailAddress.address; receivedDateTime=$m.receivedDateTime; importance=$m.importance; hasAttachments=$m.hasAttachments; webLink=$m.webLink; id=$m.id }
         }
         $csv = Join-Path (Join-Path $run 'evidence') 'email-search-results.csv'
-        @($rows) | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        $written = WriteEvidenceCsv -Path $csv -Rows @($rows) -Append
+        New-EntraSharkEvidenceReport -Run $run | Out-Null
+        Log "Updated email-search-results.csv with $(@($rows).Count) new recent row(s); table now has $written row(s)"
         return [ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count; mode='recent'; count=$top }
     }
     function InvokeRecentTeams {
@@ -1203,12 +1235,14 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         Log "Extracting most recent $top chat thread(s)"
         $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" }
         $out = Join-Path (Join-Path $run 'raw') 'teams-recent.json'
-        $r | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $out -Encoding UTF8
+        WriteRawJson -Path $out -Value $r
         $rows = foreach($c in @($r.value)){
             [pscustomobject]@{ topic=$c.topic; chatType=$c.chatType; createdDateTime=$c.createdDateTime; lastUpdatedDateTime=$c.lastUpdatedDateTime; webUrl=$c.webUrl; id=$c.id }
         }
         $csv = Join-Path (Join-Path $run 'evidence') 'teams-search-results.csv'
-        @($rows) | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        $written = WriteEvidenceCsv -Path $csv -Rows @($rows) -Append
+        New-EntraSharkEvidenceReport -Run $run | Out-Null
+        Log "Updated teams-search-results.csv with $(@($rows).Count) new recent row(s); table now has $written row(s)"
         return [ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count; mode='recent'; count=$top }
     }
     function InvokeDeviceOwnerMap {
@@ -1241,9 +1275,10 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             }
         }
         $out = Join-Path (Join-Path $run 'raw') 'device-owner-map.json'
-        @($all.ToArray()) | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $out -Encoding UTF8
+        WriteRawJson -Path $out -Value @($all.ToArray())
         $csv = Join-Path (Join-Path $run 'evidence') 'device-owner-map.csv'
-        @($rows) | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        WriteEvidenceCsv -Path $csv -Rows @($rows) | Out-Null
+        New-EntraSharkEvidenceReport -Run $run | Out-Null
         return [ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count; devicesWithOwners=@($rows | Where-Object { $_.ownerCount -gt 0 }).Count }
     }
     $Task.state='running'; $Task.started=(Get-Date).ToString('o'); $Task.message='Running attack module'; SaveTask $Task
@@ -1260,9 +1295,10 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             Log 'Running updatable group probe'
             $rows = @(NormalizeRowsForCsv (Test-GraphGroupWriteAccess -PassThru))
             $out = Join-Path (Join-Path $run 'raw') 'updatable-groups.json'
-            $rows | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $out -Encoding UTF8
+            WriteRawJson -Path $out -Value $rows
             $csv = Join-Path (Join-Path $run 'evidence') 'updatable-groups.csv'
-            @($rows) | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+            WriteEvidenceCsv -Path $csv -Rows @($rows) | Out-Null
+            New-EntraSharkEvidenceReport -Run $run | Out-Null
             Log "Wrote updatable-groups.csv with $(@($rows).Count) row(s)"
             $Task.result=[ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count }
         } elseif ($Attack.kind -eq 'deviceMap') {
@@ -1288,9 +1324,9 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             $tempRun = Join-Path $Task.dir 'isolated-run'
             $params = @{ OutputDirectory=$tempRun; Quiet=$true; Modules=([string[]]$modules) }
             $result = Invoke-EntraShark @params
-            $merged = MergeTempRunArtifacts -TempRun $result.OutputDirectory -RequestedDataset ([string]$Attack.dataset)
-            $Task.result=[ordered]@{ outputDirectory=$run; tempRun=$result.OutputDirectory; modules=$result.Modules; findingCount=$result.Findings.Count; mergedEvidenceFiles=$merged; report=(Join-Path $run 'report.html') }
-            Log "Isolated collection merged $merged evidence file(s) into active run"
+            $merge = Merge-EntraSharkRunArtifactSet -TargetRun $run -TempRun $result.OutputDirectory -RequestedDataset ([string]$Attack.dataset)
+            $Task.result=[ordered]@{ outputDirectory=$run; tempRun=$result.OutputDirectory; modules=$result.Modules; findingCount=$result.Findings.Count; mergedEvidenceFiles=$merge.MergedEvidenceFiles; report=$merge.Report; reportTables=$merge.TableCount; reportRows=$merge.RowCount }
+            Log "Isolated collection merged $($merge.MergedEvidenceFiles) evidence operation(s) into active run and regenerated report"
         } elseif ($Attack.kind -eq 'groupWrite') {
             if ($Attack.confirmText -ne 'AUTHORIZED') { throw 'Write actions require confirmation text AUTHORIZED.' }
             $token = Get-EntraSharkToken -Token $global:tokens
@@ -1596,7 +1632,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <div class="tablewrap"><table id="dataTable"></table></div>
 </div>
 <div id="report" class="panel">
-<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
+<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
 </div>
 <div id="attacks" class="panel">
 <div class="grid">
@@ -1903,6 +1939,7 @@ async function startRecon(){ setActivity('Starting recon task...', 'busy'); cons
 async function startAttack(body, stayOnData){ setActivity('Starting module task...', 'busy'); const j=await postJson('/api/attack',body); if(!j.ok){ setActivity(j.error||'Module task could not be queued.', 'error'); return; } activeTask=j.task.id; selectedTask=j.task.id; setActivity('Module task queued: '+activeTask); if(!stayOnData) showPanelById('logs'); await refreshState(); await refreshTask(activeTask, true); }
 async function refreshTask(id, resetLog){ const j=await getJson('/api/task?id='+encodeURIComponent(id)); if(!j.ok) return; const t=j.task; document.getElementById('taskSummary').innerHTML = `<p><b>${esc(t.kind)}</b> - ${esc(t.state)} - ${esc(t.message||'')}</p>${t.error?'<p style="color:#b42318">'+esc(t.error)+'</p>':''}`; appendLogRows(id, j.log||[], resetLog); if(t.state==='running') setActivity(`${t.kind} running: ${t.message||''}`, 'busy'); const dev = t.result && t.result.verificationUri ? t.result : null; if(dev){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=`<h3>Device Code Sign-in</h3><p>Open <a target="_blank" href="${esc(dev.verificationUri)}">${esc(dev.verificationUri)}</a></p><p style="font-size:26px"><b>${esc(dev.userCode)}</b></p><p>${esc(dev.message||'')}</p>`; } if(t.state==='completed'||t.state==='failed'){ setActivity(`${t.kind} ${t.state}: ${t.message||''}`, t.state==='failed'?'error':''); if((t.kind||'').includes('auth')){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=t.state==='completed'?'<h3>Authentication complete</h3><p>Token inventory has been refreshed from the current environment/vault.</p>':`<h3>Authentication failed</h3><p>${esc(t.error||t.message||'Authentication failed.')}</p>`; } if(activeTask===id) activeTask=null; await refreshState(); reloadReport(); } }
 function reloadReport(){ setActivity('Refreshing report frame...', 'busy'); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity('Report frame refreshed.'); }
+async function regenerateReport(){ setActivity('Regenerating report from existing evidence...', 'busy'); const j=await postJson('/api/report/rebuild',{}); if(!j.ok){ setActivity(j.error||'Report regeneration failed.', 'error'); return; } await refreshState(); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity(`Report regenerated from ${j.result.tableCount} table(s), ${j.result.rowCount||0} row(s).`); }
 function hideReportFrame(){ document.getElementById('reportFrameWrap').style.display='none'; setActivity('Report frame hidden.'); }
 function showReportFrame(){ document.getElementById('reportFrameWrap').style.display='block'; reloadReport(); }
 function showReport(){ setActivity('Opening report panel...', 'busy'); reloadReport(); showPanelById('report'); }
@@ -1941,6 +1978,12 @@ function Route {
     }
     if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/tokens/refresh') {
         Send-Response $Response (ConvertTo-JsonText ([ordered]@{ ok=$true; tokens=(Get-TokenSummary) })); return
+    }
+    if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/report/rebuild') {
+        $run = Get-CurrentRun
+        if (-not $run) { throw 'No current run is selected.' }
+        $result = New-EntraSharkEvidenceReport -Run $run
+        Send-Response $Response (ConvertTo-JsonText ([ordered]@{ ok=$true; result=[ordered]@{ report=$result.Report; tableCount=$result.TableCount; rowCount=$result.RowCount } })); return
     }
     if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/auth') {
         $body = Normalize-AuthRequest -Auth $body
