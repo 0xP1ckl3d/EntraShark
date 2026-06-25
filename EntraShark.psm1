@@ -694,8 +694,14 @@ function Export-EntraSharkCsv {
     param([object]$State, [string]$Name, [object[]]$Rows)
 
     if (-not $Rows -or $Rows.Count -eq 0) {
-        Register-EntraSharkDataset -State $State -Name $Name -Path $null -RowCount 0
-        return $null
+        $path = Join-Path (Join-Path $State.OutputDirectory 'evidence') "$Name.csv"
+        [pscustomobject]@{
+            status = 'empty'
+            detail = "Dataset $Name was collected but returned no rows."
+            collectedAt = (Get-Date).ToString('o')
+        } | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+        Register-EntraSharkDataset -State $State -Name $Name -Path $path -RowCount 1
+        return $path
     }
     $path = Join-Path (Join-Path $State.OutputDirectory 'evidence') "$Name.csv"
     $Rows | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
@@ -755,6 +761,29 @@ function Add-EntraSharkCollectionError {
     $rows += $row
     @($rows) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
     return $path
+}
+
+function Read-EntraSharkTextWithRetry {
+    param([Parameter(Mandatory)][string]$Path, [int]$Retries = 8, [int]$DelayMs = 150)
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try { return Get-Content -LiteralPath $Path -Raw -ErrorAction Stop } catch [System.IO.IOException] {
+            if ($i -ge ($Retries - 1)) { throw }
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
+function Write-EntraSharkTextWithRetry {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text, [int]$Retries = 8, [int]$DelayMs = 150)
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            Set-Content -LiteralPath $Path -Value $Text -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch [System.IO.IOException] {
+            if ($i -ge ($Retries - 1)) { throw }
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
 }
 
 function Merge-EntraSharkCsvFile {
@@ -832,13 +861,13 @@ function Merge-EntraSharkRunDatabase {
         return $true
     }
     Backup-EntraSharkRunFile -Run $TargetRun -Path $dstPath -Kind 'run-db' | Out-Null
-    $dst = Get-Content -LiteralPath $dstPath -Raw | ConvertFrom-Json
-    $src = Get-Content -LiteralPath $srcPath -Raw | ConvertFrom-Json
+    $dst = Read-EntraSharkTextWithRetry -Path $dstPath | ConvertFrom-Json
+    $src = Read-EntraSharkTextWithRetry -Path $srcPath | ConvertFrom-Json
     foreach ($map in @('entitiesById','relationsByKey','directoryRoleDefinitionsById','armRoleDefinitionsById','unresolvedIds','datasets')) {
         if (-not $dst.PSObject.Properties[$map]) { $dst | Add-Member -NotePropertyName $map -NotePropertyValue ([pscustomobject]@{}) }
         if ($src.PSObject.Properties[$map]) { MergeJsonMap $dst.$map $src.$map }
     }
-    $dst | ConvertTo-Json -Depth 80 | Set-Content -LiteralPath $dstPath -Encoding UTF8
+    Write-EntraSharkTextWithRetry -Path $dstPath -Text ($dst | ConvertTo-Json -Depth 80)
     return $true
 }
 
@@ -849,6 +878,23 @@ function New-EntraSharkEvidenceReport {
     $evidenceDir = Join-Path $resolved 'evidence'
     $report = Join-Path $resolved 'report.html'
     $tabs = @()
+    $findings = @()
+    $summaryPath = Join-Path $resolved 'summary.json'
+    $rootFindingsPath = Join-Path $resolved 'findings.csv'
+    $evidenceFindingsPath = Join-Path $evidenceDir 'findings.csv'
+    $summary = $null
+
+    if (Test-Path -LiteralPath $summaryPath) {
+        try {
+            $summary = Read-EntraSharkTextWithRetry -Path $summaryPath | ConvertFrom-Json
+            if ($summary -and $summary.findings) { $findings = @($summary.findings) }
+        } catch {}
+    }
+    if ($findings.Count -eq 0) {
+        $findingCsv = if (Test-Path -LiteralPath $rootFindingsPath) { $rootFindingsPath } elseif (Test-Path -LiteralPath $evidenceFindingsPath) { $evidenceFindingsPath } else { $null }
+        if ($findingCsv) { $findings = @(Import-EntraSharkCsvSafe -Path $findingCsv) }
+    }
+
     if (Test-Path -LiteralPath $evidenceDir) {
         foreach ($csv in @(Get-ChildItem -LiteralPath $evidenceDir -Filter '*.csv' -File | Sort-Object Name)) {
             $rows = @(Import-EntraSharkCsvSafe -Path $csv.FullName)
@@ -862,11 +908,46 @@ function New-EntraSharkEvidenceReport {
     }
     $json = ($tabs | ConvertTo-Json -Depth 60 -Compress)
     $safeJson = $json.Replace('</script', '<\/script')
+    $findingCount = @($findings).Count
+    $severityCounts = @($findings | Group-Object severity | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ' | '
+    if (-not $severityCounts) { $severityCounts = 'None' }
     $safeRun = [System.Net.WebUtility]::HtmlEncode($resolved)
+    $cards = foreach ($finding in @($findings | Sort-Object @{ Expression = { Get-EntraSharkSeverityRank (Get-EntraSharkProperty -InputObject $_ -Name 'severity') }; Descending = $true }, category, title)) {
+        $severity = [string](Get-EntraSharkProperty -InputObject $finding -Name 'severity' -Default 'Info')
+        $category = [System.Net.WebUtility]::HtmlEncode([string](Get-EntraSharkProperty -InputObject $finding -Name 'category'))
+        $title = [System.Net.WebUtility]::HtmlEncode([string](Get-EntraSharkProperty -InputObject $finding -Name 'title'))
+        $description = [System.Net.WebUtility]::HtmlEncode([string](Get-EntraSharkProperty -InputObject $finding -Name 'description'))
+        $remediation = [System.Net.WebUtility]::HtmlEncode([string](Get-EntraSharkProperty -InputObject $finding -Name 'remediation'))
+        $apiCalls = Get-EntraSharkProperty -InputObject $finding -Name 'apiCalls'
+        if (-not $apiCalls) { $apiCalls = Get-EntraSharkProperty -InputObject $finding -Name 'api calls' }
+        $api = [System.Net.WebUtility]::HtmlEncode((@($apiCalls) -join ', '))
+        $evidenceObject = Get-EntraSharkProperty -InputObject $finding -Name 'evidence'
+        $evidenceText = if ($null -ne $evidenceObject) { $evidenceObject | ConvertTo-Json -Depth 30 } else { '' }
+        $evidencePreviewText = if ($evidenceText.Length -gt 1800) { $evidenceText.Substring(0, 1800) + "`n... preview truncated; expand for full evidence ..." } else { $evidenceText }
+        $evidence = [System.Net.WebUtility]::HtmlEncode($evidenceText)
+        $evidencePreview = [System.Net.WebUtility]::HtmlEncode($evidencePreviewText)
+        @"
+<section class="finding severity-$($severity.ToLowerInvariant())">
+  <div class="finding-head"><span class="severity">$([System.Net.WebUtility]::HtmlEncode($severity))</span><span class="category">$category</span></div>
+  <h2>$title</h2>
+  <p>$description</p>
+  <h3>Evidence</h3>
+  <pre>$evidencePreview</pre>
+  <details class="evidence-full"><summary>Show full evidence</summary><pre>$evidence</pre></details>
+  <h3>API calls</h3>
+  <p class="api">$api</p>
+  <h3>Remediation</h3>
+  <p>$remediation</p>
+</section>
+"@
+    }
+    if (@($cards).Count -eq 0) {
+        $cards = @('<section class="finding severity-info"><h2>No findings available in recovered evidence</h2><p>No findings were found in summary.json or findings.csv. Use the Report tab collection actions to rerun modules that produce findings.</p></section>')
+    }
     $html = @"
 <!doctype html><html><head><meta charset="utf-8"><title>EntraShark Report</title>
-<style>body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#18202a}header{background:#0c2038;color:white;padding:22px 32px}main{padding:20px}.tabs{display:flex;gap:6px;flex-wrap:wrap}.tabs button{border:1px solid #cbd5e1;background:white;border-radius:6px;padding:7px 10px}.tabs button.active{background:#0c4a75;color:white}.table-wrap{margin-top:12px;overflow:auto;max-height:760px;border:1px solid #dce3ee;background:white}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #e5e7eb;padding:7px 9px;text-align:left;vertical-align:top;max-width:420px;overflow-wrap:anywhere}th{position:sticky;top:0;background:#f8fafc}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px;width:min(560px,100%);margin-top:12px}.meta{color:#475569;font-size:12px;margin-top:4px}</style></head>
-<body><header><h1>EntraShark Report</h1><div>Run: $safeRun</div><div class="meta">Regenerated: $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('o')))</div></header><main><div id="tabs" class="tabs"></div><input id="filter" placeholder="Filter current table"><div class="table-wrap"><table id="tbl"></table></div></main>
+<style>body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#18202a}header{background:#0c2038;color:white;padding:28px 40px}main{max-width:1180px;margin:0 auto;padding:28px}h1{margin:0 0 8px;font-size:28px}.meta{color:#d8e6f7;line-height:1.5}.summary{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:12px;margin:18px 0 24px}.tile{background:white;border:1px solid #dce3ee;border-radius:8px;padding:14px}.tile strong{display:block;font-size:24px;color:#0c4a75}.finding{background:white;border:1px solid #dce3ee;border-left:7px solid #64748b;border-radius:8px;padding:18px 20px;margin:16px 0}.severity-critical{border-left-color:#7f1d1d}.severity-high{border-left-color:#c2410c}.severity-medium{border-left-color:#ca8a04}.severity-low{border-left-color:#2563eb}.severity-info{border-left-color:#64748b}.severity-positive{border-left-color:#15803d}.finding-head{display:flex;gap:10px;align-items:center}.severity{font-weight:700;padding:3px 8px;border-radius:4px;background:#e8eef7}.category{color:#526071}h2{margin:10px 0;font-size:20px}h3{margin:14px 0 6px;font-size:14px;color:#344054;text-transform:uppercase;letter-spacing:.02em}p{line-height:1.45}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#d1d5db;padding:12px;border-radius:6px;font-size:12px}.evidence-full summary{cursor:pointer;color:#0c4a75;font-weight:600;margin:8px 0}.api{font-family:Consolas,monospace;color:#344054}.tabs{display:flex;gap:6px;flex-wrap:wrap}.tabs button{border:1px solid #cbd5e1;background:white;border-radius:6px;padding:7px 10px}.tabs button.active{background:#0c4a75;color:white}.table-wrap{margin-top:12px;overflow:auto;max-height:760px;border:1px solid #dce3ee;background:white;border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #e5e7eb;padding:7px 9px;text-align:left;vertical-align:top;max-width:420px;overflow-wrap:anywhere}th{position:sticky;top:0;background:#f8fafc}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px;width:min(560px,100%);margin-top:12px}.dataset-section{margin-top:28px}</style></head>
+<body><header><h1>EntraShark Authorised Recon Report</h1><div class="meta">Run: $safeRun<br>Regenerated: $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('o')))</div></header><main><section class="summary"><div class="tile"><strong>$findingCount</strong>Findings</div><div class="tile"><strong>$($tabs.Count)</strong>Evidence tables</div><div class="tile"><strong>$((@($tabs | ForEach-Object { $_.totalRows }) | Measure-Object -Sum).Sum)</strong>Evidence rows</div><div class="tile"><strong>$([System.Net.WebUtility]::HtmlEncode($severityCounts))</strong>Severity spread</div></section>$($cards -join "`n")<section class="dataset-section"><h2>Evidence Datasets</h2><p>Datasets are included after findings for drill-down review. Large files show the first 1000 rows here; full evidence remains in the run folder.</p><div id="tabs" class="tabs"></div><input id="filter" placeholder="Filter current table"><div class="table-wrap"><table id="tbl"></table></div></section></main>
 <script id="data" type="application/json">$safeJson</script><script>
 const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur=tabs[0]?.name||'';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function cell(v){const t=String(v??'');return /^https?:\/\//i.test(t)?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t)+'">'+esc(t)+'</a>':esc(t)}function renderTabs(){const wrap=document.getElementById('tabs');wrap.innerHTML='';tabs.forEach(t=>{const b=document.createElement('button');b.className=t.name===cur?'active':'';b.textContent=t.name+' ('+(t.totalRows??0)+')';b.onclick=()=>{cur=t.name;renderTabs();render()};wrap.appendChild(b)})}function render(){const data=tabs.find(t=>t.name===cur)||{rows:[],totalRows:0};const term=(document.getElementById('filter').value||'').toLowerCase();const rows=term?data.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):data.rows;const cols=[];rows.forEach(r=>Object.keys(r||{}).forEach(k=>{if(!cols.includes(k))cols.push(k)}));document.getElementById('tbl').innerHTML=cols.length?'<caption style="text-align:left;padding:8px;font-weight:600">'+esc(cur)+' - showing '+rows.length+' of '+(data.totalRows??rows.length)+' row(s)</caption><thead><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody>':'<tbody><tr><td>No rows</td></tr></tbody>'}document.getElementById('filter').addEventListener('input',render);renderTabs();render();
 </script></body></html>
@@ -925,11 +1006,13 @@ function Merge-EntraSharkRunArtifactSet {
         $requestedCsv = Join-Path (Join-Path $target 'evidence') "$RequestedDataset.csv"
         $hasRequested = Test-Path -LiteralPath $requestedCsv
         if (-not $hasRequested) {
-            Add-EntraSharkCollectionError -Run $target -Dataset $RequestedDataset -Marker ([pscustomobject]@{
+            $marker = [pscustomobject]@{
                 status = 'not-returned'
                 detail = "The module completed but did not produce $RequestedDataset.csv. Check api-calls.csv and collection-errors.csv."
                 collectedAt = (Get-Date).ToString('o')
-            }) -SourceFile $temp | Out-Null
+            }
+            Add-EntraSharkCollectionError -Run $target -Dataset $RequestedDataset -Marker $marker -SourceFile $temp | Out-Null
+            $marker | Export-Csv -LiteralPath $requestedCsv -NoTypeInformation -Encoding UTF8
         }
     }
     $report = New-EntraSharkEvidenceReport -Run $target
@@ -1756,11 +1839,27 @@ function Invoke-EntraSharkConditionalAccessModule {
 
     $State.Modules[$module] = $result
     Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
-    if ($legacySource) {
-        Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows ($policies.Items | Select-Object objectId,id,displayName,state,policyType,createdDateTime,modifiedDateTime) | Out-Null
-    } else {
-        Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows ($policies.Items | Select-Object id,displayName,state,createdDateTime,modifiedDateTime) | Out-Null
+    $policyRows = foreach ($policy in @($policies.Items)) {
+        [pscustomobject]@{
+            id = if ($legacySource) { Get-EntraSharkProperty -InputObject $policy -Name 'objectId' -Default (Get-EntraSharkProperty -InputObject $policy -Name 'id') } else { Get-EntraSharkProperty -InputObject $policy -Name 'id' }
+            displayName = Get-EntraSharkProperty -InputObject $policy -Name 'displayName'
+            state = Get-EntraSharkProperty -InputObject $policy -Name 'state'
+            policyType = Get-EntraSharkProperty -InputObject $policy -Name 'policyType'
+            createdDateTime = Get-EntraSharkProperty -InputObject $policy -Name 'createdDateTime'
+            modifiedDateTime = Get-EntraSharkProperty -InputObject $policy -Name 'modifiedDateTime'
+            conditions = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'conditions')
+            grantControls = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'grantControls')
+            sessionControls = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'sessionControls')
+            users = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'users')
+            applications = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'applications')
+            platforms = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'platforms')
+            locations = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'locations')
+            clientAppTypes = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'clientAppTypes')
+            rawPolicy = ConvertTo-EntraSharkDbString $policy
+            source = if ($legacySource) { 'AzureADGraphLegacy' } else { 'MicrosoftGraph' }
+        }
     }
+    Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows @($policyRows) | Out-Null
 
     if ($policies.Success) {
         $apiLabel = if ($legacySource) { 'GET https://graph.windows.net/{tenant}/policies?api-version=1.61-internal' } else { 'GET /v1.0/identity/conditionalAccess/policies' }
@@ -2020,6 +2119,10 @@ function Invoke-EntraSharkArmModule {
         $result = [pscustomobject]@{ skipped = $true; reason = 'No ARM token available' }
         $State.Modules[$module] = $result
         Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
+        $marker = [pscustomobject]@{ status = 'skipped'; detail = 'No ARM token available for this run. Refresh/acquire an ARM audience token and rerun ARM collection.'; collectedAt = (Get-Date).ToString('o') }
+        foreach ($datasetName in @('arm-subscriptions','arm-resource-groups','arm-resources','arm-role-assignments','arm-role-definitions')) {
+            Export-EntraSharkCsv -State $State -Name $datasetName -Rows @($marker) | Out-Null
+        }
         Add-EntraSharkFinding -State $State -Id 'ES-ARM-000' -Severity 'Info' -Category 'Azure Resource Manager' -Title 'ARM enumeration skipped' -Description 'No ARM token was available. Run with -RefreshArm or supply -ArmTokenVar after obtaining an ARM audience token.' -Evidence @{ armToken = $false } -ApiCalls @() -Remediation 'For full Azure-plane coverage, refresh or acquire an ARM token during an authorised test.'
         return
     }

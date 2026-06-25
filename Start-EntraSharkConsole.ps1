@@ -988,7 +988,7 @@ $refreshJob = {
             $params.OutVar = [string]$outVar
             $resolvedResource = $resource
             $resourceKey = "$resource".ToLowerInvariant()
-            if ($script:ResourceAliases.Contains($resourceKey)) { $resolvedResource = $script:ResourceAliases[$resourceKey] }
+            if ($script:ResourceAliases -and $script:ResourceAliases.Contains($resourceKey)) { $resolvedResource = $script:ResourceAliases[$resourceKey] }
             if (-not $params.Contains('UseV1Endpoint') -and ($resolvedResource -match 'graph\.windows\.net' -or $resolvedResource -match 'management\.core\.windows\.net')) {
                 $params.UseV1Endpoint = $true
                 Log 'Resource requires legacy v1 OAuth endpoint; switching endpoint automatically.'
@@ -1078,6 +1078,36 @@ $attackJob = {
         if (Test-Path -LiteralPath $Path) { BackupRunFile -Path $Path -Kind 'evidence' | Out-Null }
         @($newRows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
         return $newRows.Count
+    }
+    function AppendApiCall {
+        param([string]$Module, [string]$Method, [string]$Uri, [int]$StatusCode, [bool]$Success, [string]$ErrorMessage)
+        $row = [pscustomobject]@{
+            module = $Module
+            method = $Method
+            uri = $Uri
+            statusCode = $StatusCode
+            success = $Success
+            errorMessage = $ErrorMessage
+            timestamp = (Get-Date).ToString('o')
+        }
+        foreach ($path in @((Join-Path $run 'api-calls.csv'), (Join-Path (Join-Path $run 'evidence') 'api-calls.csv'))) {
+            $rows = @()
+            if (Test-Path -LiteralPath $path) {
+                for ($i=0; $i -lt 8; $i++) {
+                    try { $rows = @(Import-Csv -LiteralPath $path -ErrorAction Stop); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 150 }
+                }
+            }
+            $rows += $row
+            for ($i=0; $i -lt 8; $i++) {
+                try { @($rows) | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop; break } catch [System.IO.IOException] { if ($i -ge 7) { throw }; Start-Sleep -Milliseconds 150 }
+            }
+        }
+    }
+    function GetHttpStatusCodeFromError($ErrorRecord) {
+        try {
+            if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) { return [int]$ErrorRecord.Exception.Response.StatusCode }
+        } catch {}
+        return 0
     }
     function WriteRawJson($Path, $Value) {
         if (Test-Path -LiteralPath $Path) { BackupRunFile -Path $Path -Kind 'raw' | Out-Null }
@@ -1241,9 +1271,12 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         Log "Running $Name search: $Query"
         try {
             $r = Invoke-RestMethod -Method POST -Uri 'https://graph.microsoft.com/v1.0/search/query' -Headers @{ Authorization="Bearer $($token.AccessToken)"; 'Content-Type'='application/json' } -Body $body -ContentType 'application/json' -ErrorAction Stop
+            AppendApiCall -Module $Name -Method 'POST' -Uri 'https://graph.microsoft.com/v1.0/search/query' -StatusCode 200 -Success $true -ErrorMessage ''
         } catch {
             $raw = $_.ErrorDetails.Message
             if ($raw) { Log "Microsoft Search error body: $raw" }
+            $errText = if ($raw) { $raw } else { $_.Exception.Message }
+            AppendApiCall -Module $Name -Method 'POST' -Uri 'https://graph.microsoft.com/v1.0/search/query' -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $errText
             throw
         }
         $out = Join-Path (Join-Path $run 'raw') $RawName
@@ -1288,7 +1321,13 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         $top = [Math]::Max(1, [Math]::Min($Count, 500))
         $uri = "https://graph.microsoft.com/v1.0/me/messages?`$top=$top&`$orderby=receivedDateTime desc&`$select=id,subject,from,receivedDateTime,webLink,hasAttachments,importance"
         Log "Extracting most recent $top email message(s)"
-        $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" }
+        try {
+            $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" } -ErrorAction Stop
+            AppendApiCall -Module 'mailRecent' -Method 'GET' -Uri $uri -StatusCode 200 -Success $true -ErrorMessage ''
+        } catch {
+            AppendApiCall -Module 'mailRecent' -Method 'GET' -Uri $uri -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $_.Exception.Message
+            throw
+        }
         $out = Join-Path (Join-Path $run 'raw') 'email-recent.json'
         WriteRawJson -Path $out -Value $r
         $rows = foreach($m in @($r.value)){
@@ -1307,7 +1346,13 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         $top = [Math]::Max(1, [Math]::Min($Count, 100))
         $uri = "https://graph.microsoft.com/v1.0/me/chats?`$top=$top"
         Log "Extracting most recent $top chat thread(s)"
-        $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" }
+        try {
+            $r = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization="Bearer $($token.AccessToken)" } -ErrorAction Stop
+            AppendApiCall -Module 'teamsRecent' -Method 'GET' -Uri $uri -StatusCode 200 -Success $true -ErrorMessage ''
+        } catch {
+            AppendApiCall -Module 'teamsRecent' -Method 'GET' -Uri $uri -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $_.Exception.Message
+            throw
+        }
         $out = Join-Path (Join-Path $run 'raw') 'teams-recent.json'
         WriteRawJson -Path $out -Value $r
         $rows = foreach($c in @($r.value)){
@@ -1326,7 +1371,14 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         $uri = 'https://graph.microsoft.com/v1.0/devices?$expand=registeredOwners&$top=999'
         $all = New-Object System.Collections.Generic.List[object]
         do {
-            $r = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
+            $callUri = $uri
+            try {
+                $r = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
+                AppendApiCall -Module 'deviceMap' -Method 'GET' -Uri $callUri -StatusCode 200 -Success $true -ErrorMessage ''
+            } catch {
+                AppendApiCall -Module 'deviceMap' -Method 'GET' -Uri $callUri -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $_.Exception.Message
+                throw
+            }
             foreach ($d in @($r.value)) { $all.Add($d) | Out-Null }
             $uri = $r.'@odata.nextLink'
         } while ($uri)
@@ -1373,6 +1425,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             WriteRawJson -Path $out -Value $resultObject
             $csv = Join-Path (Join-Path $run 'evidence') 'updatable-groups.csv'
             WriteEvidenceCsv -Path $csv -Rows @($rows) | Out-Null
+            AppendApiCall -Module 'updatableGroups' -Method 'HELPER' -Uri 'Invoke-TestGroupWriteAccess.ps1 / estimateAccess probes' -StatusCode 200 -Success $true -ErrorMessage ''
             New-EntraSharkEvidenceReport -Run $run | Out-Null
             Log "Wrote updatable-groups.csv with $(@($rows).Count) row(s)"
             $Task.result=[ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count }
@@ -1408,9 +1461,23 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             $headers = @{ Authorization="Bearer $($token.AccessToken)"; 'Content-Type'='application/json' }
             if ($Attack.mode -eq 'add') {
                 $body = @{ '@odata.id'="https://graph.microsoft.com/v1.0/directoryObjects/$($Attack.userId)" } | ConvertTo-Json
-                Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/$($Attack.groupId)/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json'
+                $uri = "https://graph.microsoft.com/v1.0/groups/$($Attack.groupId)/members/`$ref"
+                try {
+                    Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body -ContentType 'application/json' -ErrorAction Stop
+                    AppendApiCall -Module 'groupWrite' -Method 'POST' -Uri $uri -StatusCode 200 -Success $true -ErrorMessage ''
+                } catch {
+                    AppendApiCall -Module 'groupWrite' -Method 'POST' -Uri $uri -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $_.Exception.Message
+                    throw
+                }
             } elseif ($Attack.mode -eq 'remove') {
-                Invoke-RestMethod -Method DELETE -Uri "https://graph.microsoft.com/v1.0/groups/$($Attack.groupId)/members/$($Attack.userId)/`$ref" -Headers $headers
+                $uri = "https://graph.microsoft.com/v1.0/groups/$($Attack.groupId)/members/$($Attack.userId)/`$ref"
+                try {
+                    Invoke-RestMethod -Method DELETE -Uri $uri -Headers $headers -ErrorAction Stop
+                    AppendApiCall -Module 'groupWrite' -Method 'DELETE' -Uri $uri -StatusCode 200 -Success $true -ErrorMessage ''
+                } catch {
+                    AppendApiCall -Module 'groupWrite' -Method 'DELETE' -Uri $uri -StatusCode (GetHttpStatusCodeFromError $_) -Success $false -ErrorMessage $_.Exception.Message
+                    throw
+                }
             } else { throw 'Unknown group write mode.' }
             $Task.result=[ordered]@{ mode=$Attack.mode; groupId=$Attack.groupId; userId=$Attack.userId }
         } else { throw 'Unknown attack kind.' }
@@ -1476,7 +1543,12 @@ function Read-RunDatabase {
     if (-not $Run) { return $null }
     $path = Join-Path $Run 'run-db.json'
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return $null }
+    for ($i = 0; $i -lt 8; $i++) {
+        try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json) } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 150
+        } catch { return $null }
+    }
+    return $null
 }
 
 function Get-RunDbMapValue {
@@ -1710,7 +1782,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <div class="tablewrap"><table id="dataTable"></table></div>
 </div>
 <div id="report" class="panel">
-<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
+<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div class="hint"><h3>Report Finding Producers</h3><button onclick="rerunReportModule('tenant','domains')">Rerun Tenant</button><button onclick="rerunReportModule('users','users')">Rerun Users</button><button onclick="rerunReportModule('roles','role-members')">Rerun Roles/PIM</button><button onclick="rerunReportModule('groups','groups')">Rerun Groups</button><button onclick="rerunReportModule('apps','permissions-enum')">Rerun Apps/Permissions</button><button onclick="rerunReportModule('devices','devices')">Rerun Devices</button><button onclick="rerunReportModule('conditionalAccess','conditional-access-policies')">Rerun Conditional Access</button><button onclick="rerunReportModule('m365','sharepoint-discovered-site-urls')">Rerun M365</button><button onclick="rerunReportModule('arm','arm-subscriptions')">Rerun ARM</button><button onclick="rerunReportModule('correlator','attack-paths')">Rerun Correlation</button></div><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
 </div>
 <div id="attacks" class="panel">
 <div class="grid">
@@ -1755,7 +1827,24 @@ const tableCatalog = [
   {group:'Run DB', tables:['db-entities','db-relations','db-directory-role-definitions','db-arm-role-definitions','db-unresolved-ids','api-calls','findings']}
 ];
 const collectActions = {
+  'domains': {kind:'collectModule', modules:['tenant'], label:'Rerun now'},
+  'users': {kind:'collectModule', modules:['users'], label:'Rerun now'},
+  'role-members': {kind:'collectModule', modules:['roles'], label:'Rerun now'},
+  'administrative-units': {kind:'collectModule', modules:['administrativeUnits'], label:'Rerun now'},
+  'administrative-unit-member-samples': {kind:'collectModule', modules:['administrativeUnits'], label:'Rerun now'},
+  'groups': {kind:'collectModule', modules:['groups'], label:'Rerun now'},
+  'group-owner-samples': {kind:'collectModule', modules:['groups'], label:'Rerun now'},
+  'group-member-samples': {kind:'collectModule', modules:['groups'], label:'Rerun now'},
   'updatable-groups': {kind:'updatableGroups', label:'Collect now'},
+  'applications': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'service-principals': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'application-owners': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'service-principal-owners': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'oauth2-grants': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'app-role-assignments': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'federated-identity-credentials': {kind:'collectModule', modules:['apps'], label:'Rerun now'},
+  'role-assignments': {kind:'collectModule', modules:['roles'], label:'Rerun now'},
+  'devices': {kind:'collectModule', modules:['devices'], label:'Rerun now'},
   'device-owner-map': {kind:'deviceMap', label:'Map now'},
   'email-search-results': {kind:'mailPull', label:'Configure search', queryId:'mailQuery', form:'mail'},
   'teams-search-results': {kind:'teamsSearch', label:'Configure search', queryId:'teamsQuery', form:'teams'},
@@ -1763,6 +1852,7 @@ const collectActions = {
   'sharepoint-discovered-site-urls': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'sharepoint-sites': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'sharepoint-site-permissions': {kind:'collectModule', modules:['m365'], label:'Collect now'},
+  'drive-shared-with-me': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'joined-teams': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'team-channels': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'inbox-message-rules': {kind:'collectModule', modules:['m365'], label:'Collect now'},
@@ -1897,10 +1987,12 @@ function renderTableGroups(){
   const known=new Set(tableCatalog.flatMap(g=>g.tables));
   if(!tableCatalog.some(g=>g.group===activeDataGroup)) activeDataGroup = tableCatalog[0].group;
   const active = tableCatalog.find(g=>g.group===activeDataGroup) || tableCatalog[0];
+  const extra=(state.tables||[]).filter(t=>!known.has(t.name));
+  const activeTables = activeDataGroup==='Run DB' ? active.tables.concat(extra.map(t=>t.name)) : active.tables;
   let html='<div class="explorerShell"><div class="groupNav">';
   html += tableCatalog.map(g=>`<button class="${g.group===activeDataGroup?'active':''}" onclick="setDataGroup('${esc(g.group)}')">${esc(g.group)}</button>`).join('');
   html += '</div><div><div class="datasetBar">';
-  active.tables.forEach(name=>{
+  activeTables.forEach(name=>{
     const t=have[name];
     const action=collectActions[name];
     if(t) {
@@ -1915,8 +2007,6 @@ function renderTableGroups(){
   const missing=active.tables.filter(name=>!have[name]);
   if(missing.length) html += `<div class="empty">${missing.length} expected dataset(s) not collected yet: ${esc(missing.map(prettyName).join(', '))}</div>`;
   html += '</div></div>';
-  const extra=(state.tables||[]).filter(t=>!known.has(t.name));
-  if(extra.length) html += `<div class="tableGroup"><h3>Other Evidence</h3><div class="datasetBar">${extra.map(t=>`<button class="${currentTable===t.name?'active':''}" onclick="openDatasetTab('${esc(t.name)}', true)">${esc(t.name)}</button>`).join('')}</div></div>`;
   root.innerHTML=html || '<div class="empty">No evidence tables yet. Run recon or an attack module.</div>';
   restoreDataActionPanel();
 }
@@ -2055,6 +2145,7 @@ async function startAttack(body, stayOnData){ setActivity('Starting module task.
 async function refreshTask(id, resetLog){ const j=await getJson('/api/task?id='+encodeURIComponent(id)); if(!j.ok) return; const t=j.task; document.getElementById('taskSummary').innerHTML = `<p><b>${esc(t.kind)}</b> - ${esc(t.state)} - ${esc(t.message||'')}</p>${t.error?'<p style="color:#b42318">'+esc(t.error)+'</p>':''}`; appendLogRows(id, j.log||[], resetLog); if(t.state==='running') setActivity(`${t.kind} running: ${t.message||''}`, 'busy'); const dev = t.result && t.result.verificationUri ? t.result : null; if(dev){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=`<h3>Device Code Sign-in</h3><p>Open <a target="_blank" href="${esc(dev.verificationUri)}">${esc(dev.verificationUri)}</a></p><p style="font-size:26px"><b>${esc(dev.userCode)}</b></p><p>${esc(dev.message||'')}</p>`; } if(t.state==='completed'||t.state==='failed'){ setActivity(`${t.kind} ${t.state}: ${t.message||''}`, t.state==='failed'?'error':''); if((t.kind||'').includes('auth')){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=t.state==='completed'?'<h3>Authentication complete</h3><p>Token inventory has been refreshed from the current environment/vault.</p>':`<h3>Authentication failed</h3><p>${esc(t.error||t.message||'Authentication failed.')}</p>`; } if(activeTask===id) activeTask=null; await refreshState(); reloadReport(); } }
 function reloadReport(){ setActivity('Refreshing report frame...', 'busy'); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity('Report frame refreshed.'); }
 async function regenerateReport(){ setActivity('Regenerating report from existing evidence...', 'busy'); const j=await postJson('/api/report/rebuild',{}); if(!j.ok){ setActivity(j.error||'Report regeneration failed.', 'error'); return; } await refreshState(); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity(`Report regenerated from ${j.result.tableCount} table(s), ${j.result.rowCount||0} row(s).`); }
+async function rerunReportModule(moduleName, datasetName){ setActivity(`Rerunning ${moduleName} for report findings...`, 'busy'); await startAttack({kind:'collectModule', modules:[moduleName], dataset:datasetName}, true); showPanelById('report'); }
 function hideReportFrame(){ document.getElementById('reportFrameWrap').style.display='none'; setActivity('Report frame hidden.'); }
 function showReportFrame(){ document.getElementById('reportFrameWrap').style.display='block'; reloadReport(); }
 function showReport(){ setActivity('Opening report panel...', 'busy'); reloadReport(); showPanelById('report'); }
