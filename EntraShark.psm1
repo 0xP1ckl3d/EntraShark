@@ -871,6 +871,236 @@ function Merge-EntraSharkRunDatabase {
     return $true
 }
 
+function New-EntraSharkFindingsFromEvidence {
+    param([Parameter(Mandatory)][string]$Run)
+
+    $resolved = (Resolve-Path -LiteralPath $Run -ErrorAction Stop).Path
+    $evidenceDir = Join-Path $resolved 'evidence'
+    if (-not (Test-Path -LiteralPath $evidenceDir)) { throw "Evidence directory not found: $evidenceDir" }
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    $markerStatuses = @('not-returned','failed','empty','denied','skipped')
+
+    function ReadEvidenceTable([string]$Name) {
+        $path = Join-Path $evidenceDir "$Name.csv"
+        if (-not (Test-Path -LiteralPath $path)) { return @() }
+        return @(Import-EntraSharkCsvSafe -Path $path)
+    }
+    function GetRealRows([object[]]$Rows) {
+        return @($Rows | Where-Object {
+            -not ($_.PSObject.Properties.Name -contains 'status' -and ([string]$_.status) -in $markerStatuses)
+        })
+    }
+    function AddEvidenceFinding([string]$Id, [string]$Severity, [string]$Category, [string]$Title, [string]$Description, [object]$Evidence, [string[]]$ApiCalls, [string]$Remediation) {
+        if (@($findings.ToArray() | Where-Object { $_.id -eq $Id }).Count -gt 0) { return }
+        $findings.Add([pscustomobject]@{
+            id          = $Id
+            severity    = $Severity
+            category    = $Category
+            title       = $Title
+            description = $Description
+            evidence    = $Evidence
+            apiCalls    = $ApiCalls
+            remediation = $Remediation
+        }) | Out-Null
+    }
+
+    $domains = @(GetRealRows @(ReadEvidenceTable 'domains'))
+    if ($domains.Count -gt 0) {
+        $unverified = @($domains | Where-Object { "$($_.isVerified)" -eq 'False' })
+        if ($unverified.Count -gt 0) {
+            AddEvidenceFinding 'ES-TENANT-005' 'Low' 'Domains' 'Unverified domains are present' 'Unverified domains can reveal abandoned onboarding or domain hygiene issues that deserve review.' (@{ unverifiedDomainCount=$unverified.Count; sample=@($unverified | Select-Object id,isDefault,isInitial,isVerified -First 25) }) @('GET /v1.0/domains') 'Remove stale unverified domains or complete verification for legitimate domains.'
+        }
+    }
+
+    $users = @(GetRealRows @(ReadEvidenceTable 'users'))
+    if ($users.Count -gt 0) {
+        AddEvidenceFinding 'ES-USERS-001' 'Info' 'Directory Exposure' 'User directory enumeration succeeded' 'The token can enumerate directory users. This evidence shows what this account can see.' (@{ userCount=$users.Count }) @('GET /v1.0/users') 'Review whether broad user inventory visibility is acceptable for the assessed identity.'
+        $highValue = @($users | Where-Object { "$($_.displayName) $($_.userPrincipalName) $($_.jobTitle)" -match '(?i)admin|administrator|privileged|security|identity|cloud|global|tenant|exchange|sharepoint|intune|azure|owner|executive|director|chief|service' } | Select-Object id,displayName,userPrincipalName,jobTitle,department -First 100)
+        if ($highValue.Count -gt 0) {
+            AddEvidenceFinding 'ES-USERS-002' 'Medium' 'Targeting' 'High-value identity candidates are visible' 'Directory user metadata exposes likely administrators, service accounts, executives, or cloud operators.' (@{ candidateCount=$highValue.Count; sample=$highValue }) @('GET /v1.0/users') 'Reduce unnecessary role/title leakage where possible and protect high-value accounts with strong MFA and monitoring.'
+        }
+        $guests = @($users | Where-Object { "$($_.userType)" -eq 'Guest' })
+        if ($guests.Count -gt 0) {
+            AddEvidenceFinding 'ES-USERS-003' 'Info' 'External Collaboration' 'Guest accounts are visible' 'Guest accounts are enumerable and should be reviewed for stale invitations, role assignment, and unnecessary access.' (@{ guestCount=$guests.Count }) @('GET /v1.0/users') 'Review guest lifecycle controls and remove stale or unneeded guests.'
+        }
+        $hybrid = @($users | Where-Object { "$($_.onPremisesSyncEnabled)" -eq 'True' })
+        if ($hybrid.Count -gt 0) {
+            AddEvidenceFinding 'ES-USERS-004' 'Info' 'Hybrid Identity' 'Hybrid-synced users are visible' 'Synced users reveal hybrid identity posture and likely on-premises pivot relevance.' (@{ syncedUserCount=$hybrid.Count }) @('GET /v1.0/users') 'Treat hybrid identity as part of the same attack path and validate AD Connect, federation, and password reset controls.'
+        }
+    }
+
+    $roleMembers = @(GetRealRows @(ReadEvidenceTable 'role-members'))
+    if ($roleMembers.Count -gt 0) {
+        $priv = @($roleMembers | Where-Object { $script:KnownHighValueRoleNames -contains $_.roleName } | Select-Object roleName,memberDisplayName,userPrincipalName,appId,objectType -First 100)
+        if ($priv.Count -gt 0) {
+            AddEvidenceFinding 'ES-ROLES-001' 'High' 'Privilege Map' 'Privileged role membership is visible' 'The token can enumerate members of high-impact Entra roles, exposing priority targets and escalation anchors.' (@{ privilegedMemberCount=$priv.Count; sample=$priv }) @('GET /v1.0/directoryRoles', 'GET /v1.0/directoryRoles/{id}/members') 'Minimise standing role membership, use PIM where possible, and monitor role member enumeration.'
+        }
+        $spPriv = @($roleMembers | Where-Object { $_.appId -or "$($_.objectType)" -match 'servicePrincipal|application' } | Select-Object roleName,memberDisplayName,appId,objectType -First 100)
+        if ($spPriv.Count -gt 0) {
+            AddEvidenceFinding 'ES-ROLES-002' 'High' 'Application Privilege' 'Service principals hold directory roles' 'Service principals in privileged roles can become headless escalation paths if their credentials or workload identity chain are compromised.' (@{ servicePrincipalRoleMemberCount=$spPriv.Count; sample=$spPriv }) @('GET /v1.0/directoryRoles/{id}/members') 'Review privileged service principals, remove unnecessary role assignments, and rotate or eliminate long-lived credentials.'
+        }
+    }
+    $pim = @(GetRealRows @(ReadEvidenceTable 'pim-eligible-roles'))
+    if ($pim.Count -gt 0) {
+        AddEvidenceFinding 'ES-ROLES-004' 'High' 'PIM' 'PIM eligible role assignments are visible' 'Eligible directory role assignments expose dormant privileged principals and JIT activation targets.' (@{ eligibleAssignmentCount=$pim.Count; sample=@($pim | Select-Object -First 100) }) @('GET /v1.0/roleManagement/directory/roleEligibilityScheduleInstances') 'Review eligible assignments, require phishing-resistant MFA and approval for high-impact roles, and remove stale eligibility.'
+    }
+
+    $groups = @(GetRealRows @(ReadEvidenceTable 'groups'))
+    if ($groups.Count -gt 0) {
+        AddEvidenceFinding 'ES-GROUPS-003' 'Info' 'Directory Exposure' 'Group enumeration succeeded' 'The token can enumerate groups visible to the assessed identity.' (@{ groupCount=$groups.Count }) @('GET /v1.0/groups') 'If broad group visibility is not intended, review default user permissions and group privacy configuration.'
+        $roleAssignable = @($groups | Where-Object { "$($_.isAssignableToRole)" -eq 'True' } | Select-Object id,displayName,mail,securityEnabled,visibility -First 100)
+        if ($roleAssignable.Count -gt 0) {
+            AddEvidenceFinding 'ES-GROUPS-001' 'High' 'Groups' 'Role-assignable groups are present' 'Role-assignable groups can confer directory roles. Ownership and membership changes to these groups are high-impact.' (@{ roleAssignableGroupCount=$roleAssignable.Count; sample=$roleAssignable }) @('GET /v1.0/groups') 'Review owners and members of role-assignable groups, require PIM where supported, and alert on membership changes.'
+        }
+        $dynamicRisk = @($groups | Where-Object {
+            [string](Get-EntraSharkProperty -InputObject $_ -Name 'membershipRule') -match '(?i)user\.(department|jobTitle|employeeId|companyName|city|country|postalCode|state|streetAddress|otherMails|extension)'
+        } | ForEach-Object {
+            [pscustomobject]@{
+                id = Get-EntraSharkProperty -InputObject $_ -Name 'id'
+                displayName = Get-EntraSharkProperty -InputObject $_ -Name 'displayName'
+                membershipRule = Get-EntraSharkProperty -InputObject $_ -Name 'membershipRule'
+            }
+        } | Select-Object -First 100)
+        if ($dynamicRisk.Count -gt 0) {
+            AddEvidenceFinding 'ES-GROUPS-002' 'Medium' 'Groups' 'Dynamic groups use potentially mutable user attributes' 'Dynamic membership rules based on profile attributes can become privilege paths if users can alter the matching attribute.' (@{ dynamicRiskCount=$dynamicRisk.Count; sample=$dynamicRisk }) @('GET /v1.0/groups') 'Avoid user-editable attributes in privileged dynamic group rules and validate who can update matched attributes.'
+        }
+    }
+    $updatable = @(GetRealRows @(ReadEvidenceTable 'updatable-groups'))
+    $writable = @($updatable | Where-Object { "$($_.verdict)" -match '(?i)^WRITE|CAN WRITE|YES' })
+    if ($writable.Count -gt 0) {
+        AddEvidenceFinding 'ES-GROUPS-005' 'High' 'Groups' 'Current user can update group membership' 'Group write-access checks indicate the assessed user can update one or more groups.' (@{ writableGroupCount=$writable.Count; sample=@($writable | Select-Object -First 100) }) @('estimateAccess microsoft.directory/groups/members/update') 'Review group ownership, role assignments, and default group management permissions.'
+    }
+
+    $apps = @(GetRealRows @(ReadEvidenceTable 'applications'))
+    if ($apps.Count -gt 0) {
+        $multiTenant = @($apps | Where-Object { "$($_.signInAudience)" -match 'AzureADMultipleOrgs|AzureADandPersonalMicrosoftAccount' } | Select-Object id,appId,displayName,signInAudience,publisherDomain -First 100)
+        if ($multiTenant.Count -gt 0) {
+            AddEvidenceFinding 'ES-APPS-002' 'Medium' 'Applications' 'Multi-tenant app registrations are present' 'Multi-tenant applications expand exposure beyond the home tenant and should have a clear owner and consent model.' (@{ multiTenantAppCount=$multiTenant.Count; sample=$multiTenant }) @('GET /v1.0/applications') 'Review multi-tenant applications, restrict unnecessary external audiences, and validate publisher verification.'
+        }
+    }
+    $sps = @(GetRealRows @(ReadEvidenceTable 'service-principals'))
+    if ($sps.Count -gt 0) {
+        $managed = @($sps | Where-Object { "$($_.servicePrincipalType)" -match 'ManagedIdentity' })
+        if ($managed.Count -gt 0) {
+            AddEvidenceFinding 'ES-APPS-003' 'Info' 'Managed Identity' 'Managed identities are visible' 'Managed identities can become useful attack-path nodes when linked to Azure RBAC, Key Vault, or application hosting access.' (@{ managedIdentityCount=$managed.Count }) @('GET /v1.0/servicePrincipals') 'Correlate managed identities to ARM resources and remove unnecessary permissions.'
+        }
+    }
+    $grants = @(GetRealRows @(ReadEvidenceTable 'oauth2-grants'))
+    $broadGrants = @($grants | Where-Object { "$($_.scope)" -match $script:BroadConsentScopePattern } | Select-Object id,clientId,consentType,principalId,resourceId,scope -First 100)
+    if ($broadGrants.Count -gt 0) {
+        AddEvidenceFinding 'ES-APPS-005' 'High' 'OAuth Consent' 'Broad OAuth delegated grants are visible' 'Delegated OAuth grants include high-impact scopes that can expose mail, files, directory data, or offline refresh capability.' (@{ broadGrantCount=$broadGrants.Count; sample=$broadGrants }) @('GET /v1.0/oauth2PermissionGrants') 'Review delegated grants, revoke unnecessary consents, and restrict user consent to approved permission classifications.'
+    }
+    $fic = @(GetRealRows @(ReadEvidenceTable 'federated-identity-credentials'))
+    if ($fic.Count -gt 0) {
+        AddEvidenceFinding 'ES-APPS-007' 'High' 'Workload Identity' 'Federated identity credentials are present' 'Federated identity credentials can allow external workload providers such as CI/CD platforms to mint tokens as the application.' (@{ federatedCredentialCount=$fic.Count; sample=@($fic | Select-Object -First 100) }) @('GET /v1.0/applications/{id}/federatedIdentityCredentials') 'Review issuer/subject bindings, scope them tightly to trusted repositories/workflows, and monitor FIC additions.'
+    }
+    $permissions = @(GetRealRows @(ReadEvidenceTable 'permissions-enum'))
+    if ($permissions.Count -gt 0) {
+        AddEvidenceFinding 'ES-APPS-009' 'Info' 'Permissions' 'Application and delegated permissions were normalised' 'OAuth grants and app role assignments were normalised into a single permissions review table.' (@{ permissionRowCount=$permissions.Count; sample=@($permissions | Select-Object -First 50) }) @('GET /v1.0/oauth2PermissionGrants', 'GET /v1.0/servicePrincipals/{id}/appRoleAssignments') 'Use the permissions table to review delegated and application permissions by principal and resource.'
+    }
+
+    $devices = @(GetRealRows @(ReadEvidenceTable 'devices'))
+    if ($devices.Count -gt 0) {
+        AddEvidenceFinding 'ES-DEVICES-001' 'Info' 'Devices' 'Device inventory is visible' 'The token can enumerate device inventory visible to the assessed identity.' (@{ deviceCount=$devices.Count }) @('GET /v1.0/devices') 'Review device visibility and stale/non-compliant devices.'
+        $problemDevices = @($devices | Where-Object { "$($_.isCompliant)" -eq 'False' -or "$($_.isManaged)" -eq 'False' } | Select-Object id,displayName,operatingSystem,trustType,isCompliant,isManaged,approximateLastSignInDateTime -First 100)
+        if ($problemDevices.Count -gt 0) {
+            AddEvidenceFinding 'ES-DEVICES-002' 'Medium' 'Devices' 'Unmanaged or non-compliant devices are visible' 'Device inventory includes unmanaged or non-compliant endpoints that may affect conditional access and endpoint risk posture.' (@{ problemDeviceCount=$problemDevices.Count; sample=$problemDevices }) @('GET /v1.0/devices') 'Review device compliance, ownership, and stale registration cleanup.'
+        }
+    }
+
+    $ca = @(GetRealRows @(ReadEvidenceTable 'conditional-access-policies'))
+    if ($ca.Count -gt 0) {
+        AddEvidenceFinding 'ES-CA-001' 'Medium' 'Conditional Access' 'Conditional Access policies are readable' 'Conditional Access policy settings are available, allowing review of MFA, device, location, and exclusion logic.' (@{ policyCount=$ca.Count; sample=@($ca | Select-Object id,displayName,state,users,applications,locations,grantControls -First 50) }) @('GET /v1.0/identity/conditionalAccess/policies') 'Ensure only approved roles can read policy detail and monitor policy enumeration.'
+        $disabled = @($ca | Where-Object { "$($_.state)" -match '(?i)disabled|reportOnly' } | Select-Object id,displayName,state -First 100)
+        if ($disabled.Count -gt 0) {
+            AddEvidenceFinding 'ES-CA-002' 'Low' 'Conditional Access' 'Conditional Access policies are disabled or report-only' 'Policies in disabled or report-only state may represent intended exceptions, unfinished rollouts, or stale controls.' (@{ disabledOrReportOnlyCount=$disabled.Count; sample=$disabled }) @('GET /v1.0/identity/conditionalAccess/policies') 'Review disabled and report-only policies for continued business need and planned enforcement.'
+        }
+    }
+
+    $joinedTeams = @(GetRealRows @(ReadEvidenceTable 'joined-teams'))
+    $channels = @(GetRealRows @(ReadEvidenceTable 'team-channels'))
+    if ($joinedTeams.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-001' 'Info' 'Teams' 'Joined Teams and channels are visible' 'The token can enumerate Teams joined by the current user and channel metadata where collected.' (@{ joinedTeamCount=$joinedTeams.Count; sampledChannelCount=$channels.Count }) @('GET /v1.0/me/joinedTeams', 'GET /v1.0/teams/{id}/channels') 'Review broad team membership and private channel use for sensitive work.'
+    }
+    $shared = @(GetRealRows @(ReadEvidenceTable 'drive-shared-with-me'))
+    if ($shared.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-003' 'Medium' 'M365 Data Exposure' 'Shared OneDrive/SharePoint items are visible' 'Items shared with the current user are enumerable and can reveal broad or stale data sharing.' (@{ sharedItemCount=$shared.Count; sample=@($shared | Select-Object id,name,webUrl -First 100) }) @('GET /v1.0/me/drive/sharedWithMe') 'Review sharing links and remove stale or broad file access.'
+    }
+    $rules = @(GetRealRows @(ReadEvidenceTable 'inbox-message-rules'))
+    if ($rules.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-004' 'Medium' 'Exchange Online' 'Inbox rules are readable' 'Inbox rules can reveal forwarding, hiding, or persistence behaviours relevant to mailbox compromise assessment.' (@{ inboxRuleCount=$rules.Count; sample=@($rules | Select-Object id,displayName,isEnabled,sequence -First 100) }) @('GET /v1.0/me/mailFolders/inbox/messageRules') 'Review suspicious forwarding or delete/move rules and monitor mailbox rule changes.'
+    }
+    $sites = @(GetRealRows @(ReadEvidenceTable 'sharepoint-sites'))
+    if ($sites.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-005' 'Info' 'SharePoint' 'SharePoint sites are discoverable' 'The token can enumerate SharePoint site metadata visible to the current user.' (@{ siteCount=$sites.Count; sample=@($sites | Select-Object id,displayName,webUrl -First 100) }) @('GET /v1.0/sites?search=*') 'Review site visibility, broad group membership, and sensitive site naming exposure.'
+    }
+    $siteUrls = @(GetRealRows @(ReadEvidenceTable 'sharepoint-discovered-site-urls'))
+    if ($siteUrls.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-007' 'Info' 'SharePoint' 'SharePoint site URLs discovered through Graph Search' 'Graph Search drive queries revealed SharePoint site URLs visible to the current user.' (@{ discoveredSiteUrlCount=$siteUrls.Count; sample=@($siteUrls | Select-Object siteId,webUrl,driveName -First 25) }) @('POST /v1.0/search/query entityTypes=drive') 'Review sensitive site naming and broad site discoverability for the assessed user context.'
+    }
+    $sitePerms = @(GetRealRows @(ReadEvidenceTable 'sharepoint-site-permissions'))
+    if ($sitePerms.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-006' 'Info' 'SharePoint' 'SharePoint site permissions are enumerable' 'Site permission objects are available for sampled SharePoint sites, supporting review of direct grants and sharing links.' (@{ sampledPermissionCount=$sitePerms.Count; sample=@($sitePerms | Select-Object siteName,roles,principalName,principalType,linkType,linkScope -First 100) }) @('GET /v1.0/sites/{id}/permissions') 'Review direct site permissions and sharing links for excessive or stale access.'
+    }
+    $searchHits = @(@(GetRealRows @(ReadEvidenceTable 'email-search-results')) + @(GetRealRows @(ReadEvidenceTable 'teams-search-results')) + @(GetRealRows @(ReadEvidenceTable 'sharepoint-search-results')))
+    if ($searchHits.Count -gt 0) {
+        AddEvidenceFinding 'ES-M365-002' 'Medium' 'M365 Data Exposure' 'M365 sensitive-keyword search returned results' 'Search modules returned content hits for reviewer-supplied or default sensitive queries.' (@{ hitCount=$searchHits.Count; sample=@($searchHits | Select-Object search,query,name,subject,title,webUrl,webLink -First 100) }) @('POST /v1.0/search/query') 'Review search hits, reduce broad sharing, and educate teams not to store secrets in M365 content.'
+    }
+
+    $subs = @(GetRealRows @(ReadEvidenceTable 'arm-subscriptions'))
+    if ($subs.Count -gt 0) {
+        AddEvidenceFinding 'ES-ARM-001' 'Info' 'Azure Resource Manager' 'Azure subscriptions are visible' 'The ARM token can enumerate Azure subscriptions visible to the assessed identity.' (@{ subscriptionCount=$subs.Count; sample=@($subs | Select-Object subscriptionId,displayName,state,tenantId -First 50) }) @('GET /subscriptions') 'Review Azure RBAC scope for the assessed identity.'
+    }
+    $armAssignments = @(GetRealRows @(ReadEvidenceTable 'arm-role-assignments'))
+    if ($armAssignments.Count -gt 0) {
+        AddEvidenceFinding 'ES-ARM-002' 'Medium' 'Azure RBAC' 'Azure role assignments are visible' 'ARM role assignment visibility can expose privilege paths through Azure resources and managed identities.' (@{ roleAssignmentCount=$armAssignments.Count; sample=@($armAssignments | Select-Object -First 100) }) @('GET /subscriptions/{id}/providers/Microsoft.Authorization/roleAssignments') 'Review Azure RBAC assignments and remove unnecessary access.'
+    } elseif ($subs.Count -eq 0 -and @(ReadEvidenceTable 'arm-subscriptions').Count -gt 0) {
+        AddEvidenceFinding 'ES-ARM-000' 'Info' 'Azure Resource Manager' 'ARM enumeration was skipped or returned no subscriptions' 'Existing evidence did not contain visible Azure subscriptions for this run.' @{ subscriptionCount=0 } @('GET /subscriptions') 'Refresh/acquire an ARM token and rerun ARM collection if Azure-plane coverage is required.'
+    }
+
+    $paths = @(GetRealRows @(ReadEvidenceTable 'attack-paths'))
+    if ($paths.Count -gt 0) {
+        AddEvidenceFinding 'ES-PATH-001' 'Medium' 'Attack Path' 'Potential attack paths were derived from collected evidence' 'Correlation evidence contains one or more candidate attack paths for reviewer triage.' (@{ attackPathCount=$paths.Count; sample=@($paths | Select-Object -First 50) }) @('local correlation') 'Review each path, validate exploitability, and prioritise remediation by blast radius.'
+    }
+
+    $findingArray = @($findings.ToArray() | Sort-Object @{ Expression = { Get-EntraSharkSeverityRank (Get-EntraSharkProperty -InputObject $_ -Name 'severity') }; Descending = $true }, category, title)
+    $findingsPath = Join-Path $resolved 'findings.csv'
+    @($findingArray | Select-Object id,severity,category,title,description,remediation) | Export-Csv -LiteralPath $findingsPath -NoTypeInformation -Encoding UTF8
+    @($findingArray | Select-Object id,severity,category,title,description,remediation) | Export-Csv -LiteralPath (Join-Path $evidenceDir 'findings.csv') -NoTypeInformation -Encoding UTF8
+
+    $summaryPath = Join-Path $resolved 'summary.json'
+    if (Test-Path -LiteralPath $summaryPath) {
+        try { $summary = Read-EntraSharkTextWithRetry -Path $summaryPath | ConvertFrom-Json } catch { $summary = $null }
+    }
+    if (-not $summary) {
+        $summary = [pscustomobject]@{ started=$null; completed=$null; tenantId=$null; outputDirectory=$resolved; moduleNames=@(); graphToken=$null; armToken=$null; graph=$null; runDatabase=$null }
+    }
+    foreach ($kv in @{
+        completed = (Get-Date).ToString('o')
+        outputDirectory = $resolved
+        findingCount = $findingArray.Count
+        findings = $findingArray
+        regeneratedFindingsFromEvidence = $true
+        regeneratedFindingsAt = (Get-Date).ToString('o')
+    }.GetEnumerator()) {
+        if ($summary.PSObject.Properties[$kv.Key]) { $summary.PSObject.Properties[$kv.Key].Value = $kv.Value }
+        else { $summary | Add-Member -NotePropertyName $kv.Key -NotePropertyValue $kv.Value }
+    }
+    Write-EntraSharkTextWithRetry -Path $summaryPath -Text ($summary | ConvertTo-Json -Depth 80)
+    $report = New-EntraSharkEvidenceReport -Run $resolved
+
+    return [pscustomobject]@{
+        Run = $resolved
+        FindingCount = $findingArray.Count
+        FindingsCsv = $findingsPath
+        SummaryJson = $summaryPath
+        Report = $report.Report
+        TableCount = $report.TableCount
+        RowCount = $report.RowCount
+    }
+}
+
 function New-EntraSharkEvidenceReport {
     param([Parameter(Mandatory)][string]$Run)
 
@@ -2904,4 +3134,4 @@ function Invoke-EntraShark {
     }
 }
 
-Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep, Merge-EntraSharkRunArtifactSet, New-EntraSharkEvidenceReport
+Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep, Merge-EntraSharkRunArtifactSet, New-EntraSharkEvidenceReport, New-EntraSharkFindingsFromEvidence

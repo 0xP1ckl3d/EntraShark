@@ -12,7 +12,8 @@
         'Get-EntraSharkToken',
         'Invoke-EntraSharkTokenSweep',
         'Merge-EntraSharkRunArtifactSet',
-        'New-EntraSharkEvidenceReport'
+        'New-EntraSharkEvidenceReport',
+        'New-EntraSharkFindingsFromEvidence'
     )
     CmdletsToExport   = @()
     VariablesToExport = '*'

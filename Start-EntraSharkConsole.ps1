@@ -1090,6 +1090,24 @@ $reconJob = {
     }
 }
 
+$findingsJob = {
+    param($Task, $ModulePath, $TokenVaultPath, $CurrentRunPath, $OutputRoot)
+    Import-Module $ModulePath -Force
+    function SaveTask($t) { $t | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $t.dir 'task.json') -Encoding UTF8 }
+    function Log($msg) { [pscustomobject]@{ timestamp=(Get-Date).ToString('o'); message=$msg } | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $Task.dir 'status.jsonl') -Encoding UTF8 }
+    $Task.state='running'; $Task.started=(Get-Date).ToString('o'); $Task.message='Discovering findings from existing evidence'; SaveTask $Task
+    try {
+        $run = if (Test-Path -LiteralPath $CurrentRunPath) { (Get-Content -LiteralPath $CurrentRunPath -Raw).Trim() } else { $null }
+        if (-not $run -or -not (Test-Path -LiteralPath $run)) { throw 'No current run is selected. Load or create a run first.' }
+        Log "Reading evidence from current run: $run"
+        $result = New-EntraSharkFindingsFromEvidence -Run $run
+        $Task.state='completed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Finding discovery complete'; $Task.result=[ordered]@{ outputDirectory=$run; findingCount=$result.FindingCount; report=$result.Report; findingsCsv=$result.FindingsCsv; reportTables=$result.TableCount; reportRows=$result.RowCount }; SaveTask $Task
+        Log "Finding discovery complete; rebuilt $($result.FindingCount) finding(s) and regenerated report"
+    } catch {
+        $Task.state='failed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Finding discovery failed'; $Task.error=$_.Exception.Message; SaveTask $Task; Log "Finding discovery failed: $($_.Exception.Message)"
+    }
+}
+
 $attackJob = {
     param($Task, $ModulePath, $TokenVaultPath, $CurrentRunPath, $OutputRoot, $Attack, $ToolPath)
     Import-Module $ModulePath -Force
@@ -1812,6 +1830,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <p class="tokenMeta">Use update mode only when you intentionally loaded or just created the run you want to extend.</p>
 <label><input id="includeM365Search" type="checkbox" style="width:auto"> Include M365 sensitive keyword search</label><br>
 <button class="primary" onclick="startRecon()">Run Recon</button>
+<button class="primary" onclick="startFindingDiscovery()">Finding Discovery Only</button>
 <button onclick="showReport()">Show Current Report</button>
 </section>
 </div>
@@ -1820,7 +1839,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <div class="tablewrap"><table id="dataTable"></table></div>
 </div>
 <div id="report" class="panel">
-<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div class="hint"><h3>Report Finding Producers</h3><button onclick="rerunReportModule('tenant','domains')">Rerun Tenant</button><button onclick="rerunReportModule('users','users')">Rerun Users</button><button onclick="rerunReportModule('roles','role-members')">Rerun Roles/PIM</button><button onclick="rerunReportModule('groups','groups')">Rerun Groups</button><button onclick="rerunReportModule('apps','permissions-enum')">Rerun Apps/Permissions</button><button onclick="rerunReportModule('devices','devices')">Rerun Devices</button><button onclick="rerunReportModule('conditionalAccess','conditional-access-policies')">Rerun Conditional Access</button><button onclick="rerunReportModule('m365','sharepoint-discovered-site-urls')">Rerun M365</button><button onclick="rerunReportModule('arm','arm-subscriptions')">Rerun ARM</button><button onclick="rerunReportModule('correlator','attack-paths')">Rerun Correlation</button></div><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
+<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button class="primary" onclick="startFindingDiscovery()">Discover Findings From Existing Evidence</button><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div class="hint"><h3>Report Finding Producers</h3><button onclick="rerunReportModule('tenant','domains')">Rerun Tenant</button><button onclick="rerunReportModule('users','users')">Rerun Users</button><button onclick="rerunReportModule('roles','role-members')">Rerun Roles/PIM</button><button onclick="rerunReportModule('groups','groups')">Rerun Groups</button><button onclick="rerunReportModule('apps','permissions-enum')">Rerun Apps/Permissions</button><button onclick="rerunReportModule('devices','devices')">Rerun Devices</button><button onclick="rerunReportModule('conditionalAccess','conditional-access-policies')">Rerun Conditional Access</button><button onclick="rerunReportModule('m365','sharepoint-discovered-site-urls')">Rerun M365</button><button onclick="rerunReportModule('arm','arm-subscriptions')">Rerun ARM</button><button onclick="rerunReportModule('correlator','attack-paths')">Rerun Correlation</button></div><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
 </div>
 <div id="attacks" class="panel">
 <div class="grid">
@@ -2182,7 +2201,8 @@ async function startRecon(){ setActivity('Starting recon task...', 'busy'); cons
 async function startAttack(body, stayOnData){ setActivity('Starting module task...', 'busy'); const j=await postJson('/api/attack',body); if(!j.ok){ setActivity(j.error||'Module task could not be queued.', 'error'); return; } activeTask=j.task.id; selectedTask=j.task.id; setActivity('Module task queued: '+activeTask); if(!stayOnData) showPanelById('logs'); await refreshState(); await refreshTask(activeTask, true); }
 async function refreshTask(id, resetLog){ const j=await getJson('/api/task?id='+encodeURIComponent(id)); if(!j.ok) return; const t=j.task; document.getElementById('taskSummary').innerHTML = `<p><b>${esc(t.kind)}</b> - ${esc(t.state)} - ${esc(t.message||'')}</p>${t.error?'<p style="color:#b42318">'+esc(t.error)+'</p>':''}`; appendLogRows(id, j.log||[], resetLog); if(t.state==='running') setActivity(`${t.kind} running: ${t.message||''}`, 'busy'); const dev = t.result && t.result.verificationUri ? t.result : null; if(dev){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=`<h3>Device Code Sign-in</h3><p>Open <a target="_blank" href="${esc(dev.verificationUri)}">${esc(dev.verificationUri)}</a></p><p style="font-size:26px"><b>${esc(dev.userCode)}</b></p><p>${esc(dev.message||'')}</p>`; } if(t.state==='completed'||t.state==='failed'){ setActivity(`${t.kind} ${t.state}: ${t.message||''}`, t.state==='failed'?'error':''); if((t.kind||'').includes('auth')){ document.getElementById('deviceBox').style.display='block'; document.getElementById('deviceBox').innerHTML=t.state==='completed'?'<h3>Authentication complete</h3><p>Token inventory has been refreshed from the current environment/vault.</p>':`<h3>Authentication failed</h3><p>${esc(t.error||t.message||'Authentication failed.')}</p>`; } if(activeTask===id) activeTask=null; await refreshState(); reloadReport(); } }
 function reloadReport(){ setActivity('Refreshing report frame...', 'busy'); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity('Report frame refreshed.'); }
-async function regenerateReport(){ setActivity('Regenerating report from existing evidence...', 'busy'); const j=await postJson('/api/report/rebuild',{}); if(!j.ok){ setActivity(j.error||'Report regeneration failed.', 'error'); return; } await refreshState(); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity(`Report regenerated from ${j.result.tableCount} table(s), ${j.result.rowCount||0} row(s).`); }
+async function regenerateReport(){ setActivity('Regenerating findings and report from existing evidence...', 'busy'); const j=await postJson('/api/report/rebuild',{}); if(!j.ok){ setActivity(j.error||'Report regeneration failed.', 'error'); return; } await refreshState(); document.getElementById('reportFrame').src='/api/report?ts='+Date.now(); document.getElementById('reportFrameWrap').style.display='block'; setActivity(`Report regenerated with ${j.result.findingCount||0} finding(s) from ${j.result.tableCount} table(s), ${j.result.rowCount||0} row(s).`); }
+async function startFindingDiscovery(){ setActivity('Discovering findings from existing evidence...', 'busy'); const j=await postJson('/api/findings/rebuild',{}); if(!j.ok){ setActivity(j.error||'Finding discovery could not be queued.', 'error'); return; } activeTask=j.task.id; selectedTask=j.task.id; setActivity('Finding discovery queued: '+activeTask); await refreshState(); await refreshTask(activeTask, true); }
 async function rerunReportModule(moduleName, datasetName){ setActivity(`Rerunning ${moduleName} for report findings...`, 'busy'); await startAttack({kind:'collectModule', modules:[moduleName], dataset:datasetName}, true); showPanelById('report'); }
 function hideReportFrame(){ document.getElementById('reportFrameWrap').style.display='none'; setActivity('Report frame hidden.'); }
 function showReportFrame(){ document.getElementById('reportFrameWrap').style.display='block'; reloadReport(); }
@@ -2226,8 +2246,13 @@ function Route {
     if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/report/rebuild') {
         $run = Get-CurrentRun
         if (-not $run) { throw 'No current run is selected.' }
-        $result = New-EntraSharkEvidenceReport -Run $run
-        Send-Response $Response (ConvertTo-JsonText ([ordered]@{ ok=$true; result=[ordered]@{ report=$result.Report; tableCount=$result.TableCount; rowCount=$result.RowCount } })); return
+        $result = New-EntraSharkFindingsFromEvidence -Run $run
+        Send-Response $Response (ConvertTo-JsonText ([ordered]@{ ok=$true; result=[ordered]@{ report=$result.Report; tableCount=$result.TableCount; rowCount=$result.RowCount; findingCount=$result.FindingCount; findingsCsv=$result.FindingsCsv } })); return
+    }
+    if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/findings/rebuild') {
+        if (-not (Get-CurrentRun)) { throw 'No current run is selected.' }
+        $task = Start-ManagedTask -Kind 'findings-from-evidence' -ScriptBlock $findingsJob -ArgumentList @()
+        Send-Response $Response (ConvertTo-JsonText ([ordered]@{ ok=$true; task=$task })); return
     }
     if ($Request.HttpMethod -eq 'POST' -and $path -eq '/api/auth') {
         $body = Normalize-AuthRequest -Auth $body
