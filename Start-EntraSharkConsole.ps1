@@ -406,6 +406,44 @@ function Get-TokenSummary {
     return Get-TokenInventory
 }
 
+function Get-RunUserSummary {
+    param([string]$Run, $Tokens)
+    if (-not $Tokens) { return $null }
+    $items = @($Tokens.Keys | ForEach-Object { $Tokens[$_] })
+    $token = @($items | Where-Object { $_.audience -match 'graph\.microsoft\.com' -and $_.user } | Select-Object -First 1)
+    if (-not $token) { $token = @($items | Where-Object { $_.user } | Select-Object -First 1) }
+    if (-not $token) { return $null }
+
+    $profile = $null
+    if ($Run) {
+        $usersCsv = Join-Path (Join-Path $Run 'evidence') 'users.csv'
+        if (Test-Path -LiteralPath $usersCsv) {
+            try {
+                $profile = @(Import-Csv -LiteralPath $usersCsv | Where-Object {
+                    ($token.user -and ($_.userPrincipalName -eq $token.user -or $_.mail -eq $token.user -or $_.id -eq $token.user))
+                } | Select-Object -First 1)
+            } catch {}
+        }
+    }
+
+    return [ordered]@{
+        user = $token.user
+        tenantId = $token.tenantId
+        audience = $token.audience
+        appId = $token.appId
+        scopes = $token.scopes
+        roles = $token.roles
+        expires = $token.expires
+        isExpired = $token.isExpired
+        displayName = if ($profile) { $profile.displayName } else { $null }
+        objectId = if ($profile) { $profile.id } else { $null }
+        mail = if ($profile) { $profile.mail } else { $null }
+        jobTitle = if ($profile) { $profile.jobTitle } else { $null }
+        department = if ($profile) { $profile.department } else { $null }
+        accountEnabled = if ($profile) { $profile.accountEnabled } else { $null }
+    }
+}
+
 function Get-CurrentRun {
     return $script:ActiveRun
 }
@@ -712,6 +750,24 @@ $interactiveAuthJob = {
             [pscustomobject]$out
         }
     }
+    function ConvertGroupWriteAccessRows($Result) {
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($section in @('Passive','Probe','Live')) {
+            $items = @()
+            if ($Result -and $Result.PSObject.Properties[$section]) { $items = @($Result.$section) }
+            foreach ($item in $items) {
+                if ($null -eq $item -or $item -is [bool]) { continue }
+                $rows.Add([pscustomobject]@{
+                    checkType = $section
+                    groupId = $item.GroupId
+                    displayName = $item.Name
+                    verdict = $item.Verdict
+                    reason = $item.Reason
+                }) | Out-Null
+            }
+        }
+        return @($rows.ToArray())
+    }
     function WriteDatasetMarker {
         param([string]$Dataset, [string]$Reason, [string]$Detail)
         if (-not $Dataset) { return $null }
@@ -774,13 +830,13 @@ $interactiveAuthJob = {
             }
         }
         $json = ($tabs | ConvertTo-Json -Depth 50 -Compress)
-        $safeJson = [System.Net.WebUtility]::HtmlEncode($json)
+        $safeJson = $json.Replace('</script', '<\/script')
         $html = @"
 <!doctype html><html><head><meta charset="utf-8"><title>EntraShark Report</title>
 <style>body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fb;color:#18202a}header{background:#0c2038;color:white;padding:22px 32px}main{padding:20px}.tabs{display:flex;gap:6px;flex-wrap:wrap}.tabs button{border:1px solid #cbd5e1;background:white;border-radius:6px;padding:7px 10px}.tabs button.active{background:#0c4a75;color:white}.table-wrap{margin-top:12px;overflow:auto;max-height:760px;border:1px solid #dce3ee;background:white}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #e5e7eb;padding:7px 9px;text-align:left;vertical-align:top;max-width:420px;overflow-wrap:anywhere}th{position:sticky;top:0;background:#f8fafc}input{padding:8px;border:1px solid #cbd5e1;border-radius:6px;width:min(560px,100%);margin-top:12px}</style></head>
 <body><header><h1>EntraShark Report</h1><div>Run: $([System.Net.WebUtility]::HtmlEncode($run))</div></header><main><div id="tabs" class="tabs"></div><input id="filter" placeholder="Filter current table"><div class="table-wrap"><table id="tbl"></table></div></main>
 <script id="data" type="application/json">$safeJson</script><script>
-const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur=tabs[0]?.name||'';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function cell(v){const t=String(v??'');return /^https?:\/\//i.test(t)?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t)+'">'+esc(t)+'</a>':esc(t)}function renderTabs(){document.getElementById('tabs').innerHTML=tabs.map(t=>'<button class="'+(t.name===cur?'active':'')+'" onclick="cur=\''+esc(t.name)+'\';renderTabs();render()">'+esc(t.name)+'</button>').join('')}function render(){const data=tabs.find(t=>t.name===cur)||{rows:[]};const term=(document.getElementById('filter').value||'').toLowerCase();const rows=term?data.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):data.rows;const cols=[];rows.forEach(r=>Object.keys(r||{}).forEach(k=>{if(!cols.includes(k))cols.push(k)}));document.getElementById('tbl').innerHTML=cols.length?'<caption style="text-align:left;padding:8px;font-weight:600">'+esc(cur)+' - '+rows.length+' row(s)</caption><thead><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody>':'<tbody><tr><td>No rows</td></tr></tbody>'}document.getElementById('filter').addEventListener('input',render);renderTabs();render();
+const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur=tabs[0]?.name||'';const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function cell(v){const t=String(v??'');return /^https?:\/\//i.test(t)?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t)+'">'+esc(t)+'</a>':esc(t)}function renderTabs(){const wrap=document.getElementById('tabs');wrap.innerHTML='';tabs.forEach(t=>{const b=document.createElement('button');b.className=t.name===cur?'active':'';b.textContent=t.name;b.onclick=()=>{cur=t.name;renderTabs();render()};wrap.appendChild(b)})}function render(){const data=tabs.find(t=>t.name===cur)||{rows:[]};const term=(document.getElementById('filter').value||'').toLowerCase();const rows=term?data.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):data.rows;const cols=[];rows.forEach(r=>Object.keys(r||{}).forEach(k=>{if(!cols.includes(k))cols.push(k)}));document.getElementById('tbl').innerHTML=cols.length?'<caption style="text-align:left;padding:8px;font-weight:600">'+esc(cur)+' - '+rows.length+' row(s)</caption><thead><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+cell(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody>':'<tbody><tr><td>No rows</td></tr></tbody>'}document.getElementById('filter').addEventListener('input',render);renderTabs();render();
 </script></body></html>
 "@
         $html | Set-Content -LiteralPath $report -Encoding UTF8
@@ -1047,6 +1103,24 @@ $attackJob = {
             [pscustomobject]$out
         }
     }
+    function ConvertGroupWriteAccessRows($Result) {
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($section in @('Passive','Probe','Live')) {
+            $items = @()
+            if ($Result -and $Result.PSObject.Properties[$section]) { $items = @($Result.$section) }
+            foreach ($item in $items) {
+                if ($null -eq $item -or $item -is [bool]) { continue }
+                $rows.Add([pscustomobject]@{
+                    checkType = $section
+                    groupId = $item.GroupId
+                    displayName = $item.Name
+                    verdict = $item.Verdict
+                    reason = $item.Reason
+                }) | Out-Null
+            }
+        }
+        return @($rows.ToArray())
+    }
     function WriteDatasetMarker {
         param([string]$Dataset, [string]$Reason, [string]$Detail)
         if (-not $Dataset) { return $null }
@@ -1293,9 +1367,10 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         if ($Attack.kind -eq 'updatableGroups') {
             . $ToolPath
             Log 'Running updatable group probe'
-            $rows = @(NormalizeRowsForCsv (Test-GraphGroupWriteAccess -PassThru))
+            $resultObject = Test-GraphGroupWriteAccess -PassThru
+            $rows = @(NormalizeRowsForCsv (ConvertGroupWriteAccessRows -Result $resultObject))
             $out = Join-Path (Join-Path $run 'raw') 'updatable-groups.json'
-            WriteRawJson -Path $out -Value $rows
+            WriteRawJson -Path $out -Value $resultObject
             $csv = Join-Path (Join-Path $run 'evidence') 'updatable-groups.csv'
             WriteEvidenceCsv -Path $csv -Rows @($rows) | Out-Null
             New-EntraSharkEvidenceReport -Run $run | Out-Null
@@ -1349,6 +1424,7 @@ function Get-State {
     $run = Get-CurrentRun
     $tables = @()
     $tasks = @()
+    $tokens = Get-TokenSummary
     if ($run) {
         $evidence = Join-Path $run 'evidence'
         if (Test-Path -LiteralPath $evidence) {
@@ -1364,7 +1440,8 @@ function Get-State {
     return [ordered]@{
         tenantId = $script:TenantId
         currentRun = $run
-        tokens = Get-TokenSummary
+        tokens = $tokens
+        runUser = Get-RunUserSummary -Run $run -Tokens $tokens
         options = Get-ConsoleOptions
         tables = $tables
         tasks = @($tasks | Where-Object { $_ })
@@ -1518,6 +1595,7 @@ button.danger { background:#b42318; color:white; border-color:#b42318; }
 .dataStatus.error { color:#b42318; }
 .dataActionPanel { margin-top:8px; }
 .dataActionPanel .hint { margin:0; }
+.dataActionPanel .rerunAction { margin-top:8px; }
 .collectMini { font-size:11px; padding:5px 7px; }
 .reportFrame { width:100%; height:calc(100vh - 168px); min-height:640px; border:1px solid var(--line); border-radius:8px; background:white; }
 .splitbar { display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap; }
@@ -1703,9 +1781,10 @@ const collectActions = {
   'db-arm-role-definitions': {kind:'collectModule', modules:['arm'], label:'Rebuild now'},
   'db-unresolved-ids': {kind:'collectModule', modules:['roles','apps','arm'], label:'Rebuild now'}
 };
-let state = {}, activeTask = null, currentTable = null, currentRows = [], selectedTask = null, activeDataGroup = 'Tenant & Policy';
+let state = {}, activeTask = null, currentTable = null, currentRows = [], selectedTask = null, activeDataGroup = 'Tenant & Policy', activeDataAction = null;
 let tableLoadSeq = 0;
 let logCache = {};
+let dataActionValues = {};
 let sessionModeChosen = false, sortKey = null, sortDir = 'asc';
 function val(id){ return document.getElementById(id).value; }
 function esc(v){ return String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -1740,7 +1819,7 @@ function showPanelById(id){ const btn=[...document.querySelectorAll('.nav button
 async function getJson(path){ const r=await fetch(path); return await r.json(); }
 async function postJson(path, body){ const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return await r.json(); }
 function initModules(){ document.getElementById('moduleChecks').innerHTML = modules.map(m=>`<label><input type="checkbox" class="mod" value="${m}" checked style="width:auto"> ${m}</label>`).join(''); }
-async function refreshState(){ state = await getJson('/api/state'); populateOptionLists(); renderOverview(); renderTableGroups(); renderTaskList(); document.getElementById('reportRunPath').textContent = state.currentRun || 'none'; }
+async function refreshState(){ saveDataActionValues(); state = await getJson('/api/state'); populateOptionLists(); renderOverview(); renderTableGroups(); renderTaskList(); document.getElementById('reportRunPath').textContent = state.currentRun || 'none'; restoreDataActionPanel(); }
 function populateOptionLists(){
   const opts=state.options||{};
   const clients=opts.clients||[], resources=opts.resources||[], tokenNames=opts.tokenNames||[];
@@ -1775,6 +1854,8 @@ function pickerIsDefaultOffice(presetId, customId){ const p=val(presetId), c=val
 function renderOverview(){
   const tok = state.tokens || {};
   const names = Object.keys(tok);
+  const ru = state.runUser || null;
+  const runUserHtml = ru ? `<div class="hint"><h3>Run User</h3><div class="tokenMeta"><b>User:</b> ${esc(ru.displayName||ru.user||'unknown')}<br><b>UPN/Mail:</b> ${esc(ru.user||ru.mail||'')}<br><b>ObjectId:</b> ${esc(ru.objectId||'')}<br><b>Tenant:</b> ${esc(ru.tenantId||'')}<br><b>AppId:</b> ${esc(ru.appId||'')}<br><b>Audience:</b> ${esc(ru.audience||'')}<br><b>Expires:</b> ${esc(ru.expires||'unknown')}${ru.isExpired?' (expired)':''}<br><b>Scopes:</b> ${esc(ru.scopes||'')}<br><b>Roles:</b> ${esc(Array.isArray(ru.roles)?ru.roles.join(', '):(ru.roles||''))}<br><b>Job/Dept:</b> ${esc([ru.jobTitle,ru.department].filter(Boolean).join(' / '))}</div></div>` : '<div class="empty">No Graph run user could be derived from current run tokens yet.</div>';
   const tokenHtml = names.length ? `<div class="tokenGrid">${names.map(k=>{
     const t=tok[k]||{};
     const expired=!!t.isExpired;
@@ -1782,7 +1863,7 @@ function renderOverview(){
     const refreshButton=t.canRefresh?`<button class="tokenAction" onclick="event.stopPropagation(); refreshTokenName('${esc(k)}')">${expired?'Refresh Expired Token':'Refresh With Refresh Token'}</button>`:'';
     return `<div class="tokenCard ${expired?'expired':''}" onclick="showTokenDetail('${esc(k)}')"><h3>$${esc(k)} <span class="tokenSource">${esc(t.source||'unknown')}</span><span class="tokenState ${expired?'expired':''}">${esc(stateLabel)}</span></h3><div class="tokenMeta"><b>Audience:</b> ${esc(t.audience||t.status||'unknown')}<br><b>User:</b> ${esc(t.user||'')}<br><b>Expires:</b> ${esc(t.expires||'unknown')}<br><b>Refresh token:</b> ${t.hasRefreshToken?'present':'not present'}<br>${t.status?'<b>Status:</b> '+esc(t.status):''}</div>${refreshButton}</div>`;
   }).join('')}</div>` : '<p>No live token variables found yet.</p>';
-  document.getElementById('overview-body').innerHTML = `<p><b>Current run:</b> ${esc(state.currentRun || 'none')}</p><p><b>Evidence tables:</b> ${(state.tables||[]).length}</p><h3>Tokens</h3>${tokenHtml}`;
+  document.getElementById('overview-body').innerHTML = `<p><b>Current run:</b> ${esc(state.currentRun || 'none')}</p><p><b>Evidence tables:</b> ${(state.tables||[]).length}</p>${runUserHtml}<h3>Tokens</h3>${tokenHtml}`;
 }
 async function refreshTokens(){ setActivity('Refreshing current run token view...', 'busy'); await postJson('/api/tokens/refresh',{}); await refreshState(); setActivity('Current run token view refreshed.'); }
 async function loadRun(){ const status=document.getElementById('loadRunStatus'); status.textContent='Loading...'; setActivity('Loading selected run...', 'busy'); const j=await postJson('/api/run',{path:val('loadRunPath')}); if(j.ok){ sessionModeChosen=true; selectedTask=null; activeTask=null; logCache={}; document.getElementById('taskLog').innerHTML=''; document.getElementById('taskSummary').innerHTML=''; status.textContent='Loaded '+j.run.currentRun; setActivity('Run loaded: '+j.run.currentRun); await refreshState(); reloadReport(); } else { status.textContent=j.error||'Load failed'; setActivity(j.error||'Run load failed.', 'error'); } }
@@ -1810,6 +1891,7 @@ async function refreshTokenName(name){
 function availableTables(){ const m={}; (state.tables||[]).forEach(t=>m[t.name]=t); return m; }
 function prettyName(name){ return name.split('-').map(x=>x.charAt(0).toUpperCase()+x.slice(1)).join(' '); }
 function renderTableGroups(){
+  saveDataActionValues();
   const root=document.getElementById('tableGroups');
   const have=availableTables();
   const known=new Set(tableCatalog.flatMap(g=>g.tables));
@@ -1822,15 +1904,9 @@ function renderTableGroups(){
     const t=have[name];
     const action=collectActions[name];
     if(t) {
-      html += `<button class="${currentTable===name?'active':''}" onclick="loadTable('${esc(name)}')">${esc(prettyName(name))}</button>`;
-      if(action) {
-        const fn = action.form ? 'prepareDatasetAction' : 'collectDataset';
-        const label = action.form ? 'Configure' : 'Rerun';
-        html += `<button class="collectMini" onclick="${fn}('${esc(name)}')">${label}</button>`;
-      }
+      html += `<button class="${currentTable===name?'active':''}" onclick="openDatasetTab('${esc(name)}', true)">${esc(prettyName(name))}</button>`;
     } else if(action) {
-      const fn = action.form ? 'prepareDatasetAction' : 'collectDataset';
-      html += `<button class="missing" onclick="${fn}('${esc(name)}')">${esc(prettyName(name))} - ${esc(action.label)}</button>`;
+      html += `<button class="missing ${currentTable===name?'active':''}" onclick="openDatasetTab('${esc(name)}', false)">${esc(prettyName(name))} - ${esc(action.label)}</button>`;
     } else {
       html += `<button disabled title="Not collected yet">${esc(prettyName(name))}</button>`;
     }
@@ -1840,24 +1916,61 @@ function renderTableGroups(){
   if(missing.length) html += `<div class="empty">${missing.length} expected dataset(s) not collected yet: ${esc(missing.map(prettyName).join(', '))}</div>`;
   html += '</div></div>';
   const extra=(state.tables||[]).filter(t=>!known.has(t.name));
-  if(extra.length) html += `<div class="tableGroup"><h3>Other Evidence</h3><div class="datasetBar">${extra.map(t=>`<button class="${currentTable===t.name?'active':''}" onclick="loadTable('${esc(t.name)}')">${esc(t.name)}</button>`).join('')}</div></div>`;
+  if(extra.length) html += `<div class="tableGroup"><h3>Other Evidence</h3><div class="datasetBar">${extra.map(t=>`<button class="${currentTable===t.name?'active':''}" onclick="openDatasetTab('${esc(t.name)}', true)">${esc(t.name)}</button>`).join('')}</div></div>`;
   root.innerHTML=html || '<div class="empty">No evidence tables yet. Run recon or an attack module.</div>';
+  restoreDataActionPanel();
 }
-function setDataGroup(name){ activeDataGroup=name; renderTableGroups(); setDataStatus(`Showing ${name}. Pick a dataset.`, false); }
+function setDataGroup(name){ activeDataGroup=name; activeDataAction=null; renderTableGroups(); setDataStatus(`Showing ${name}. Pick a dataset.`, false); }
 function setDataStatus(message, isError){ const el=document.getElementById('dataStatus'); el.textContent=message||''; el.className='dataStatus'+(isError?' error':''); }
-function prepareDatasetAction(name){ currentTable=name; renderTableGroups(); renderDataActionPanel(name); setDataStatus(`${prettyName(name)} ready. Configure the action below.`, false); }
+function saveDataActionValues(){
+  Object.values(collectActions).forEach(action=>{
+    if(action.queryId){ const el=document.getElementById(action.queryId); if(el) dataActionValues[action.queryId]=el.value; }
+    if(action.form){ const recent=document.getElementById(`recent-${action.form}`); if(recent) dataActionValues[`recent-${action.form}`]=recent.value; }
+  });
+}
+function defaultQueryFor(action){
+  if(action.form==='sharepoint') return 'password OR secret OR credential OR filetype:txt';
+  if(action.form==='mail' || action.form==='teams') return 'password OR secret OR credential';
+  return '';
+}
+function restoreDataActionPanel(){
+  const name=activeDataAction || (collectActions[currentTable] ? currentTable : null);
+  if(name) renderDataActionPanel(name);
+}
+function openDatasetTab(name, hasTable){
+  currentTable=name;
+  activeDataAction=collectActions[name] ? name : null;
+  renderTableGroups();
+  if(hasTable) {
+    loadTable(name);
+  } else {
+    currentRows=[];
+    document.getElementById('dataTable').innerHTML=`<tbody><tr><td>${esc(prettyName(name))} has not been collected yet.</td></tr></tbody>`;
+    setDataStatus(`${prettyName(name)} is not collected. Use the action panel below to collect it.`, false);
+  }
+}
+function prepareDatasetAction(name){ currentTable=name; activeDataAction=name; renderTableGroups(); renderDataActionPanel(name); setDataStatus(`${prettyName(name)} ready. Configure the action below.`, false); }
 function renderDataActionPanel(name){
   const el=document.getElementById('inlineDataActionPanel') || document.getElementById('dataActionPanel');
   const action=collectActions[name];
-  if(!action || !action.form){ el.innerHTML=''; return; }
+  if(!el) return;
+  if(!action){ el.innerHTML=''; return; }
   const title=prettyName(name);
+  if(!action.form){
+    el.innerHTML=`<div class="hint"><h3>${esc(title)}</h3><p>Rerun this dataset in isolation. Existing evidence is preserved in run history before replacement or merge.</p><button class="danger rerunAction" onclick="collectDataset('${esc(name)}')">Rerun This Dataset</button></div>`;
+    return;
+  }
   const qid=action.queryId, recentId=`recent-${action.form}`;
-  const recent = action.form==='sharepoint' ? '' : `<label>Extract most recent count<input id="${recentId}" type="number" min="1" max="500" value="50"></label><button onclick="collectRecent('${esc(name)}')">Extract Most Recent</button>`;
-  el.innerHTML=`<div class="hint"><h3>${esc(title)}</h3><div class="controlRow"><label>Search query<input id="${qid}" value="${esc(document.getElementById(qid)?.value || '')}"></label>${recent}</div><button class="primary" onclick="collectDataset('${esc(name)}')">Run Search</button></div>`;
+  const qval=dataActionValues[qid] ?? document.getElementById(qid)?.value ?? defaultQueryFor(action);
+  const rval=dataActionValues[recentId] ?? document.getElementById(recentId)?.value ?? '50';
+  const recent = action.form==='sharepoint' ? '' : `<label>Extract most recent count<input id="${recentId}" type="number" min="1" max="500" value="${esc(rval)}" oninput="saveDataActionValues()"></label><button onclick="collectRecent('${esc(name)}')">Extract Most Recent</button>`;
+  el.innerHTML=`<div class="hint"><h3>${esc(title)}</h3><div class="controlRow"><label>Search query<input id="${qid}" value="${esc(qval)}" oninput="saveDataActionValues()"></label>${recent}</div><button class="danger rerunAction" onclick="collectDataset('${esc(name)}')">Run / Rerun Search</button></div>`;
 }
 async function collectDataset(name){
   const action=collectActions[name];
   if(!action) return;
+  activeDataAction=name;
+  saveDataActionValues();
   renderDataActionPanel(name);
   setDataStatus(`Starting ${prettyName(name)} collection...`, false);
   setActivity(`Starting ${prettyName(name)} collection...`, 'busy');
@@ -1870,18 +1983,20 @@ async function collectDataset(name){
 }
 async function collectRecent(name){
   const action=collectActions[name];
+  activeDataAction=name;
+  saveDataActionValues();
   const count=Number(val(`recent-${action.form}`)||50);
   await startAttack({kind:action.form==='mail'?'mailRecent':'teamsRecent', count:count}, true);
 }
 async function loadTable(name){
   const seq=++tableLoadSeq;
   currentTable=name;
+  activeDataAction=collectActions[name] ? name : null;
   currentRows=[]; sortKey=null; sortDir='asc';
-  renderDataActionPanel(name);
+  renderTableGroups();
   document.getElementById('tableFilter').value='';
   document.getElementById('dataTable').innerHTML=`<tbody><tr><td>Loading ${esc(prettyName(name))}...</td></tr></tbody>`;
   setDataStatus(`Loading ${prettyName(name)}...`, false);
-  renderTableGroups();
   try {
     const j=await getJson('/api/table?name='+encodeURIComponent(name));
     if(seq!==tableLoadSeq || currentTable!==name) return;
