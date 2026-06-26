@@ -1667,8 +1667,12 @@ function Get-TableRows {
     if (-not $run) { throw 'No run exists yet.' }
     $path = Join-Path (Join-Path $run 'evidence') "$Name.csv"
     if (-not (Test-Path -LiteralPath $path)) { throw "Unknown table $Name" }
+    $rows = @(Import-Csv -LiteralPath $path | Select-Object -First 5000)
+    if ($Name -eq 'conditional-access-policies') {
+        return @($rows | ConvertTo-EntraSharkConditionalAccessPolicyView)
+    }
     $db = Read-RunDatabase -Run $run
-    return @(Import-Csv -LiteralPath $path | Select-Object -First 5000 | ForEach-Object { Add-RunDbResolvedColumns -RunDb $db -Row $_ })
+    return @($rows | ForEach-Object { Add-RunDbResolvedColumns -RunDb $db -Row $_ })
 }
 
 function Get-ConsoleHtml {
@@ -1747,6 +1751,15 @@ table { border-collapse:collapse; width:100%; font-size:12px; }
 th,td { border-bottom:1px solid #e5e7eb; padding:7px 8px; text-align:left; vertical-align:top; max-width:440px; overflow-wrap:anywhere; }
 th { position:sticky; top:0; background:#f8fafc; }
 .pill { display:inline-block; padding:3px 7px; border-radius:99px; background:#e2e8f0; margin:2px; }
+.policyGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:10px; padding:10px; }
+.policyCard { border:1px solid var(--line); border-left:6px solid #64748b; border-radius:8px; padding:12px; background:#fff; }
+.policyCard.ca { border-left-color:#ca8a04; }
+.policyCard h3 { margin:0 0 4px; font-size:15px; color:#0f3050; }
+.policyMeta { color:#475569; font-size:12px; line-height:1.5; }
+.policyMeta b { color:#1f2937; }
+.policyCard details { margin-top:8px; }
+.policyCard summary { cursor:pointer; color:#0c4a75; font-weight:600; }
+.policyCard pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:360px; overflow:auto; background:#0f172a; color:#d1d5db; border-radius:6px; padding:10px; font-size:12px; }
 .activityBar { position: sticky; top: 0; z-index: 10; display:flex; justify-content:space-between; align-items:center; gap:10px; margin:0 0 14px; padding:10px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; color:#0f3050; box-shadow:0 1px 4px rgba(15,23,42,.05); }
 .activityBar.error { border-color:#fecaca; background:#fef2f2; color:#991b1b; }
 .activityBar.busy { border-color:#fed7aa; background:#fff7ed; color:#9a3412; }
@@ -1872,11 +1885,11 @@ th { position:sticky; top:0; background:#f8fafc; }
 <script>
 const modules = ['tenant','users','auth','roles','administrativeUnits','groups','apps','devices','conditionalAccess','m365','arm','correlator'];
 const tableCatalog = [
-  {group:'Tenant & Policy', tables:['domains','conditional-access-policies']},
+  {group:'Tenant & Policy', tables:['domains','conditional-access-policies','user-permission-estimates']},
   {group:'Identity', tables:['users','risky-users','risk-detections','role-members','pim-eligible-roles','administrative-units','administrative-unit-member-samples']},
   {group:'Groups', tables:['groups','group-owner-samples','group-member-samples','updatable-groups']},
   {group:'Applications & Permissions', tables:['applications','service-principals','application-owners','service-principal-owners','oauth2-grants','app-role-assignments','federated-identity-credentials','role-assignments']},
-  {group:'Permissions', tables:['permissions-enum','oauth2-grants','app-role-assignments','role-assignments','pim-eligible-roles']},
+  {group:'Permissions', tables:['user-permission-estimates','permissions-enum','oauth2-grants','app-role-assignments','role-assignments','pim-eligible-roles']},
   {group:'Devices', tables:['devices','device-owner-map']},
   {group:'M365', tables:['sharepoint-discovered-site-urls','sharepoint-sites','sharepoint-site-permissions','drive-shared-with-me','joined-teams','team-channels','inbox-message-rules','email-search-results','teams-search-results','sharepoint-search-results']},
   {group:'Azure', tables:['arm-subscriptions','arm-resource-groups','arm-resources','arm-role-assignments','arm-role-definitions']},
@@ -1914,6 +1927,7 @@ const collectActions = {
   'team-channels': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'inbox-message-rules': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'conditional-access-policies': {kind:'collectModule', modules:['conditionalAccess'], label:'Collect now'},
+  'user-permission-estimates': {kind:'collectModule', modules:['tenant'], label:'Collect now'},
   'risky-users': {kind:'collectModule', modules:['auth'], label:'Collect now'},
   'risk-detections': {kind:'collectModule', modules:['auth'], label:'Collect now'},
   'pim-eligible-roles': {kind:'collectModule', modules:['roles'], label:'Collect now'},
@@ -2160,7 +2174,25 @@ async function loadTable(name){
 }
 function renderCell(v){ const text=typeof v==='object'?JSON.stringify(v):String(v ?? ''); if(/^https?:\/\//i.test(text)) return `<a href="${esc(text)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`; return esc(text); }
 function sortByColumn(key){ if(sortKey===key) sortDir=sortDir==='asc'?'desc':'asc'; else { sortKey=key; sortDir='asc'; } renderTable(); }
-function renderTable(){ const term=(document.getElementById('tableFilter').value||'').toLowerCase(); let rows=term?currentRows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):currentRows.slice(); if(sortKey){ rows.sort((a,b)=>String(a[sortKey]??'').localeCompare(String(b[sortKey]??''), undefined, {numeric:true,sensitivity:'base'})*(sortDir==='asc'?1:-1)); } const keys=[]; rows.forEach(r=>Object.keys(r||{}).forEach(k=>{ if(!keys.includes(k)) keys.push(k); })); if(!keys.length){ document.getElementById('dataTable').innerHTML=`<tbody><tr><td>${currentTable ? 'No rows matched this table/filter.' : 'No rows selected. Pick a collected dataset above.'}</td></tr></tbody>`; return; } document.getElementById('dataTable').innerHTML='<caption style="text-align:left;padding:7px 8px;font-weight:600">'+esc(prettyName(currentTable||''))+' - '+rows.length+' row(s)</caption><thead><tr>'+keys.map(k=>`<th onclick="sortByColumn('${esc(k)}')" title="Sort by ${esc(k)}">${esc(k)}${sortKey===k?(sortDir==='asc'?' ^':' v'):''}</th>`).join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+keys.map(k=>`<td>${renderCell(r[k])}</td>`).join('')+'</tr>').join('')+'</tbody>'; }
+function filteredRows(){ const term=(document.getElementById('tableFilter').value||'').toLowerCase(); let rows=term?currentRows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):currentRows.slice(); if(sortKey){ rows.sort((a,b)=>String(a[sortKey]??'').localeCompare(String(b[sortKey]??''), undefined, {numeric:true,sensitivity:'base'})*(sortDir==='asc'?1:-1)); } return rows; }
+function renderPolicyCards(rows){
+  const visible=rows.slice(0,500);
+  const cards=visible.map(r=>{
+    const isCa=String(r.policyTypeName||'').toLowerCase().includes('conditional access');
+    const detail=r.detailJson||r.rawPolicy||'';
+    const raw=r.rawPolicy&&r.rawPolicy!==detail?`<details><summary>Show raw source object</summary><pre>${esc(prettyJson(r.rawPolicy))}</pre></details>`:'';
+    return `<section class="policyCard ${isCa?'ca':''}"><h3>${esc(r.displayName||r.id||'Unnamed policy')}</h3><div class="policyMeta"><b>Type:</b> ${esc(r.policyTypeName||r.policyType||'')}<br><b>State:</b> ${esc(r.state||'not stated')}<br><b>Source:</b> ${esc(r.source||'')}<br><b>Users:</b> ${esc(r.users||'')}<br><b>Applications:</b> ${esc(r.applications||'')}<br><b>Locations:</b> ${esc(r.locations||'')}<br><b>Risks:</b> ${esc(r.risks||'')}<br><b>Grant controls:</b> ${esc(r.grantControls||'')}<br><b>Session controls:</b> ${esc(r.sessionControls||'')}<br><b>Detail:</b> ${esc(r.policyDetailSummary||'')}</div><details><summary>Show parsed policy JSON</summary><pre>${esc(prettyJson(detail))}</pre></details>${raw}</section>`;
+  }).join('');
+  document.getElementById('dataTable').innerHTML=`<caption style="text-align:left;padding:7px 8px;font-weight:600">${esc(prettyName(currentTable||''))} - ${rows.length} policy object(s)</caption><tbody><tr><td><div class="policyGrid">${cards||'<div class="empty">No policies matched this filter.</div>'}</div></td></tr></tbody>`;
+}
+function prettyJson(value){ try{ return JSON.stringify(JSON.parse(value), null, 2); }catch(e){ return String(value??''); } }
+function renderTable(){
+  const rows=filteredRows();
+  if(currentTable==='conditional-access-policies'){ renderPolicyCards(rows); return; }
+  const keys=[]; rows.forEach(r=>Object.keys(r||{}).forEach(k=>{ if(!keys.includes(k)) keys.push(k); }));
+  if(!keys.length){ document.getElementById('dataTable').innerHTML=`<tbody><tr><td>${currentTable ? 'No rows matched this table/filter.' : 'No rows selected. Pick a collected dataset above.'}</td></tr></tbody>`; return; }
+  document.getElementById('dataTable').innerHTML='<caption style="text-align:left;padding:7px 8px;font-weight:600">'+esc(prettyName(currentTable||''))+' - '+rows.length+' row(s)</caption><thead><tr>'+keys.map(k=>`<th onclick="sortByColumn('${esc(k)}')" title="Sort by ${esc(k)}">${esc(k)}${sortKey===k?(sortDir==='asc'?' ^':' v'):''}</th>`).join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+keys.map(k=>`<td>${renderCell(r[k])}</td>`).join('')+'</tr>').join('')+'</tbody>';
+}
 function renderTaskList(){
   const list=document.getElementById('taskList');
   const tasks=state.tasks||[];

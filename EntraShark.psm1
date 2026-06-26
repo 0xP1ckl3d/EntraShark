@@ -360,6 +360,201 @@ function ConvertTo-EntraSharkDbString {
     try { return ($Value | ConvertTo-Json -Depth 20 -Compress) } catch { return [string]$Value }
 }
 
+function ConvertFrom-EntraSharkJsonText {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -isnot [string]) { return $Value }
+    $text = $Value.Trim()
+    if (-not $text -or ($text[0] -notin @('{','['))) { return $null }
+    try { return ($text | ConvertFrom-Json) } catch { return $null }
+}
+
+function Get-EntraSharkPolicyTypeName {
+    param([object]$PolicyType)
+
+    switch ([string]$PolicyType) {
+        '2'  { 'Claims / authentication policy' }
+        '5'  { 'MDM policy' }
+        '6'  { 'Named location' }
+        '10' { 'Identity protection / user risk policy' }
+        '17' { 'Token issuance policy' }
+        '18' { 'Conditional Access policy' }
+        '20' { 'Authentication session policy' }
+        '27' { 'Activity based timeout policy' }
+        '44' { 'Authentication methods policy' }
+        default {
+            if ($PolicyType) { "Policy type $PolicyType" } else { 'Conditional Access policy' }
+        }
+    }
+}
+
+function ConvertTo-EntraSharkReviewString {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [ValueType]) { return [string]$Value }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return (@($Value | ForEach-Object { ConvertTo-EntraSharkReviewString $_ }) | Where-Object { $_ }) -join ' | '
+    }
+    $parts = @()
+    foreach ($prop in @($Value.PSObject.Properties)) {
+        $rendered = ConvertTo-EntraSharkReviewString $prop.Value
+        if ($rendered) { $parts += "$($prop.Name)=$rendered" }
+    }
+    if ($parts.Count -gt 0) { return ($parts -join '; ') }
+    return (ConvertTo-EntraSharkDbString $Value)
+}
+
+function Get-EntraSharkPolicyConditionSummary {
+    param([object]$Conditions, [string]$Name)
+
+    if ($null -eq $Conditions) { return '' }
+    $block = Get-EntraSharkProperty -InputObject $Conditions -Name $Name
+    if ($null -eq $block) { $block = Get-EntraSharkProperty -InputObject $Conditions -Name ($Name.Substring(0,1).ToLowerInvariant() + $Name.Substring(1)) }
+    if ($null -eq $block) { return '' }
+
+    $include = Get-EntraSharkProperty -InputObject $block -Name 'Include'
+    if ($null -eq $include) { $include = Get-EntraSharkProperty -InputObject $block -Name 'include' }
+    $exclude = Get-EntraSharkProperty -InputObject $block -Name 'Exclude'
+    if ($null -eq $exclude) { $exclude = Get-EntraSharkProperty -InputObject $block -Name 'exclude' }
+    $parts = @()
+    if ($null -ne $include) { $parts += "Include: $(ConvertTo-EntraSharkReviewString $include)" }
+    if ($null -ne $exclude) { $parts += "Exclude: $(ConvertTo-EntraSharkReviewString $exclude)" }
+    if ($parts.Count -gt 0) { return ($parts -join '; ') }
+    return (ConvertTo-EntraSharkReviewString $block)
+}
+
+function Get-EntraSharkPolicyDetailObjects {
+    param([object]$Policy)
+
+    $details = @()
+    foreach ($detail in @((Get-EntraSharkProperty -InputObject $Policy -Name 'policyDetail'))) {
+        $parsed = ConvertFrom-EntraSharkJsonText $detail
+        if ($parsed) { $details += $parsed }
+    }
+    if ($details.Count -eq 0) {
+        $details += $Policy
+    }
+    return @($details)
+}
+
+function ConvertTo-EntraSharkConditionalAccessPolicyView {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline)]
+        [object]$Policy,
+        [string]$Source
+    )
+
+    process {
+        if ($null -eq $Policy) { return }
+        $raw = ConvertFrom-EntraSharkJsonText (Get-EntraSharkProperty -InputObject $Policy -Name 'rawPolicy')
+        if (-not $raw) { $raw = ConvertFrom-EntraSharkJsonText $Policy }
+        if (-not $raw) { $raw = $Policy }
+
+        $details = @(Get-EntraSharkPolicyDetailObjects -Policy $raw)
+        $primary = @($details | Where-Object { Get-EntraSharkProperty -InputObject $_ -Name 'Conditions' } | Select-Object -First 1)
+        if (-not $primary) { $primary = @($details | Select-Object -First 1) }
+        $primary = $primary[0]
+
+        $conditions = Get-EntraSharkProperty -InputObject $primary -Name 'Conditions'
+        if (-not $conditions) { $conditions = Get-EntraSharkProperty -InputObject $primary -Name 'conditions' }
+        if (-not $conditions) { $conditions = Get-EntraSharkProperty -InputObject $raw -Name 'conditions' }
+
+        $controls = Get-EntraSharkProperty -InputObject $primary -Name 'Controls'
+        if (-not $controls) { $controls = Get-EntraSharkProperty -InputObject $raw -Name 'grantControls' }
+        $sessionControls = Get-EntraSharkProperty -InputObject $primary -Name 'SessionControls'
+        if (-not $sessionControls) { $sessionControls = Get-EntraSharkProperty -InputObject $raw -Name 'sessionControls' }
+
+        $policyType = Get-EntraSharkProperty -InputObject $raw -Name 'policyType' -Default (Get-EntraSharkProperty -InputObject $Policy -Name 'policyType')
+        $sourceValue = if ($Source) { $Source } else { Get-EntraSharkProperty -InputObject $Policy -Name 'source' -Default (Get-EntraSharkProperty -InputObject $raw -Name 'source') }
+        $locations = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'Locations'
+        if (-not $locations -and ([string]$policyType) -eq '6') {
+            $countries = Get-EntraSharkProperty -InputObject $primary -Name 'CountryIsoCodes'
+            $cidrs = Get-EntraSharkProperty -InputObject $primary -Name 'CidrIpRanges'
+            $compressedCidrs = Get-EntraSharkProperty -InputObject $primary -Name 'CompressedCidrIpRanges'
+            $locations = (@(
+                if ($countries) { "Countries: $(ConvertTo-EntraSharkReviewString $countries)" }
+                if ($cidrs) { "CIDRs: $(ConvertTo-EntraSharkReviewString $cidrs)" }
+                if ($compressedCidrs) { "Compressed CIDRs present" }
+                if ($null -ne (Get-EntraSharkProperty -InputObject $primary -Name 'ApplyToUnknownCountry')) { "Unknown country: $(Get-EntraSharkProperty -InputObject $primary -Name 'ApplyToUnknownCountry')" }
+            ) | Where-Object { $_ }) -join '; '
+        }
+
+        $risks = (@(
+            $signInRisk = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'SignInRisks'
+            if ($signInRisk) { "Sign-in risk: $signInRisk" }
+            $userRisk = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'UserRisks'
+            if ($userRisk) { "User risk: $userRisk" }
+            $securityPolicy = Get-EntraSharkProperty -InputObject $primary -Name 'SecurityPolicy'
+            if ($securityPolicy) { ConvertTo-EntraSharkReviewString $securityPolicy }
+        ) | Where-Object { $_ }) -join '; '
+
+        $state = Get-EntraSharkProperty -InputObject $Policy -Name 'state'
+        if (-not $state) { $state = Get-EntraSharkProperty -InputObject $primary -Name 'State' }
+        if (-not $state) { $state = Get-EntraSharkProperty -InputObject $primary -Name 'state' }
+        if (-not $state) { $state = Get-EntraSharkProperty -InputObject $primary -Name 'Mode' }
+
+        $detailSummary = (@($details | ForEach-Object {
+            ($_.PSObject.Properties.Name | Select-Object -First 12) -join ', '
+        }) | Where-Object { $_ }) -join ' | '
+
+        [pscustomobject]@{
+            id                  = Get-EntraSharkProperty -InputObject $Policy -Name 'id' -Default (Get-EntraSharkProperty -InputObject $raw -Name 'objectId' -Default (Get-EntraSharkProperty -InputObject $raw -Name 'id'))
+            displayName         = Get-EntraSharkProperty -InputObject $Policy -Name 'displayName' -Default (Get-EntraSharkProperty -InputObject $raw -Name 'displayName')
+            policyType          = $policyType
+            policyTypeName      = Get-EntraSharkPolicyTypeName $policyType
+            source              = $sourceValue
+            state               = $state
+            createdDateTime     = Get-EntraSharkProperty -InputObject $Policy -Name 'createdDateTime' -Default (Get-EntraSharkProperty -InputObject $primary -Name 'CreatedDateTime')
+            modifiedDateTime    = Get-EntraSharkProperty -InputObject $Policy -Name 'modifiedDateTime' -Default (Get-EntraSharkProperty -InputObject $primary -Name 'ModifiedDateTime')
+            users               = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'Users'
+            applications        = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'Applications'
+            platforms           = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'Platforms'
+            locations           = $locations
+            clientAppTypes      = Get-EntraSharkPolicyConditionSummary -Conditions $conditions -Name 'ClientAppTypes'
+            risks               = $risks
+            grantControls       = ConvertTo-EntraSharkReviewString $controls
+            sessionControls     = ConvertTo-EntraSharkReviewString $sessionControls
+            policyDetailSummary = $detailSummary
+            detailJson          = ConvertTo-EntraSharkDbString $details
+            rawPolicy           = ConvertTo-EntraSharkDbString $raw
+        }
+    }
+}
+
+function Get-EntraSharkHighValueResourceActions {
+    $actions = @(
+        @{ action='microsoft.directory/applications/create'; description='Create all types of applications'; severity='Medium'; category='Application Creation' },
+        @{ action='microsoft.directory/applications/createAsOwner'; description='Create applications and become the first owner'; severity='Medium'; category='Application Creation' },
+        @{ action='microsoft.directory/servicePrincipals/createAsOwner'; description='Create service principals and become the first owner'; severity='Medium'; category='Service Principal Creation' },
+        @{ action='microsoft.directory/oAuth2PermissionGrants/createAsOwner'; description='Create OAuth permission grants as owner'; severity='High'; category='OAuth Consent' },
+        @{ action='microsoft.directory/users/inviteGuest'; description='Invite guest users'; severity='Medium'; category='External Collaboration' },
+        @{ action='microsoft.directory/deviceLocalCredentials/standard/read'; description='Read backed up local administrator credential metadata for Entra joined devices'; severity='Medium'; category='Device Local Credentials' },
+        @{ action='microsoft.directory/deviceLocalCredentials/password/read'; description='Read backed up local administrator credential passwords for Entra joined devices'; severity='High'; category='Device Local Credentials' },
+        @{ action='microsoft.directory/applications/credentials/update'; description='Update application credentials'; severity='High'; category='Application Credential Control' },
+        @{ action='microsoft.directory/applications/permissions/update'; description='Update exposed and required permissions on applications'; severity='High'; category='Application Permission Control' },
+        @{ action='microsoft.directory/applications/allProperties/allTasks'; description='Create, delete, read, and update all application properties'; severity='Critical'; category='Application Administration' },
+        @{ action='microsoft.directory/servicePrincipals/managePermissionGrantsForAll.microsoft-company-admin'; description='Grant consent for any permission to any application'; severity='Critical'; category='Tenant-wide Consent' },
+        @{ action='microsoft.directory/oAuth2PermissionGrants/allProperties/allTasks'; description='Create, delete, read, and update OAuth permission grants'; severity='Critical'; category='OAuth Consent' },
+        @{ action='microsoft.directory/roleAssignments/allProperties/allTasks'; description='Create, delete, read, and update role assignments'; severity='Critical'; category='Role Management' },
+        @{ action='microsoft.directory/roleDefinitions/allProperties/allTasks'; description='Create, delete, read, and update role definitions'; severity='Critical'; category='Role Management' },
+        @{ action='microsoft.directory/groups/members/update'; description='Update group memberships'; severity='High'; category='Group Membership Control' },
+        @{ action='microsoft.directory/groups/allProperties/read'; description='Read all group properties including role-assignable groups'; severity='Medium'; category='Directory Read' },
+        @{ action='microsoft.directory/conditionalAccessPolicies/allProperties/read'; description='Read all Conditional Access policy properties'; severity='Medium'; category='Conditional Access Visibility' },
+        @{ action='microsoft.directory/identityProtection/allProperties/read'; description='Read Identity Protection resources'; severity='Medium'; category='Identity Protection Visibility' },
+        @{ action='microsoft.directory/privilegedIdentityManagement/allProperties/read'; description='Read Privileged Identity Management resources'; severity='Medium'; category='PIM Visibility' }
+    )
+    return @($actions | ForEach-Object { [pscustomobject]$_ })
+}
+
+function Get-EntraSharkHighValueActionDefinition {
+    param([string]$Action)
+    return @(Get-EntraSharkHighValueResourceActions | Where-Object { $_.action -eq $Action } | Select-Object -First 1)[0]
+}
+
 function Add-EntraSharkRelation {
     param(
         [object]$State,
@@ -886,6 +1081,11 @@ function New-EntraSharkFindingsFromEvidence {
         if (-not (Test-Path -LiteralPath $path)) { return @() }
         return @(Import-EntraSharkCsvSafe -Path $path)
     }
+    function ReadRawJson([string]$Name) {
+        $path = Join-Path (Join-Path $resolved 'raw') "$Name.json"
+        if (-not (Test-Path -LiteralPath $path)) { return $null }
+        try { return (Read-EntraSharkTextWithRetry -Path $path | ConvertFrom-Json) } catch { return $null }
+    }
     function GetRealRows([object[]]$Rows) {
         return @($Rows | Where-Object {
             -not ($_.PSObject.Properties.Name -contains 'status' -and ([string]$_.status) -in $markerStatuses)
@@ -903,6 +1103,48 @@ function New-EntraSharkFindingsFromEvidence {
             apiCalls    = $ApiCalls
             remediation = $Remediation
         }) | Out-Null
+    }
+
+    $tenantRaw = ReadRawJson 'tenant'
+    $authzPolicy = if ($tenantRaw) { Get-EntraSharkProperty -InputObject $tenantRaw -Name 'authorizationPolicy' } else { $null }
+    if ($authzPolicy) {
+        $perms = Get-EntraSharkProperty -InputObject $authzPolicy -Name 'defaultUserRolePermissions'
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToCreateApps') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-001' 'Medium' 'Tenant Defaults' 'Default users can register applications' 'Member users can create app registrations, increasing the consent-phishing and persistence surface after standard user compromise.' @{ allowedToCreateApps=$true } @('GET /v1.0/policies/authorizationPolicy') 'Disable user app registration unless there is a defined business requirement and compensating monitoring.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToCreateSecurityGroups') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-002' 'Low' 'Tenant Defaults' 'Default users can create security groups' 'Member users can create security groups, which can complicate ownership and access review hygiene.' @{ allowedToCreateSecurityGroups=$true } @('GET /v1.0/policies/authorizationPolicy') 'Restrict security group creation to approved owners.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToCreateTenants') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-006' 'Medium' 'Tenant Defaults' 'Default users can create tenants' 'Member users can create new tenants, which can enable unsanctioned shadow tenant workflows and confusing external identity paths.' @{ allowedToCreateTenants=$true } @('GET /v1.0/policies/authorizationPolicy') 'Disable default tenant creation unless there is a defined governance process.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToReadBitlockerKeysForOwnedDevice') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-007' 'Medium' 'Device Local Credentials' 'Default users can read BitLocker keys for owned devices' 'Default user role permissions allow users to read BitLocker recovery keys for devices they own.' @{ allowedToReadBitlockerKeysForOwnedDevice=$true } @('GET /v1.0/policies/authorizationPolicy') 'Review whether self-service BitLocker key retrieval is appropriate for the assessed tenant.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToReadOtherUsers') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-008' 'Info' 'Directory Exposure' 'Default users can read other users' 'Default user role permissions allow member users to read other user objects.' @{ allowedToReadOtherUsers=$true } @('GET /v1.0/policies/authorizationPolicy') 'If broad directory visibility is not desired, review default user permissions and directory restrictions.'
+        }
+        $permissionGrantPolicies = @(Get-EntraSharkProperty -InputObject $perms -Name 'permissionGrantPoliciesAssigned')
+        if ($permissionGrantPolicies.Count -gt 0) {
+            AddEvidenceFinding 'ES-TENANT-012' 'Medium' 'OAuth Consent' 'Default user consent policies are assigned' 'Authorization policy lists permission grant policies assigned to default users or owned resources. These policies define what users can consent to without an admin.' @{ permissionGrantPoliciesAssigned=$permissionGrantPolicies } @('GET /v1.0/policies/authorizationPolicy') 'Review user consent settings and keep allowed permission classifications narrow.'
+        }
+        $allowInvitesFrom = Get-EntraSharkProperty -InputObject $authzPolicy -Name 'allowInvitesFrom'
+        if ($allowInvitesFrom -and $allowInvitesFrom -ne 'none') {
+            AddEvidenceFinding 'ES-TENANT-003' 'Medium' 'External Collaboration' 'Guest invitations are allowed' 'A compromised member may be able to invite external identities, depending on the invite policy value.' @{ allowInvitesFrom=$allowInvitesFrom } @('GET /v1.0/policies/authorizationPolicy') 'Limit guest invitations to approved roles and monitor guest creation.'
+        }
+        $guestRole = Get-EntraSharkProperty -InputObject $authzPolicy -Name 'guestUserRoleId'
+        if ($guestRole -eq '10dae51f-b6af-4016-8d66-8c2a99b929b3') {
+            AddEvidenceFinding 'ES-TENANT-004' 'High' 'External Collaboration' 'Guests have member-like directory access' 'The guest user role is set to the default member role, giving B2B guests broad read visibility similar to internal users.' @{ guestUserRoleId=$guestRole } @('GET /v1.0/policies/authorizationPolicy') 'Use the restricted guest user role unless business requirements explicitly require member-equivalent guest access.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $authzPolicy -Name 'allowEmailVerifiedUsersToJoinOrganization') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-009' 'Low' 'External Collaboration' 'Email-verified users can join the organization' 'The authorization policy allows email-verified users to join the organization, which should be explicitly governed.' @{ allowEmailVerifiedUsersToJoinOrganization=$true } @('GET /v1.0/policies/authorizationPolicy') 'Review external collaboration and self-service join settings.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $authzPolicy -Name 'allowUserConsentForRiskyApps') -eq $true) {
+            AddEvidenceFinding 'ES-TENANT-010' 'High' 'OAuth Consent' 'Users can consent to risky applications' 'The tenant authorization policy allows user consent for risky apps.' @{ allowUserConsentForRiskyApps=$true } @('GET /v1.0/policies/authorizationPolicy') 'Disable risky app user consent and route application consent through admin approval.'
+        }
+        if ((Get-EntraSharkProperty -InputObject $authzPolicy -Name 'blockMsolPowerShell') -eq $false) {
+            AddEvidenceFinding 'ES-TENANT-011' 'Low' 'Legacy Administration' 'MSOL PowerShell is not blocked' 'Legacy MSOL PowerShell access is not blocked by authorization policy, leaving an older administration surface available.' @{ blockMsolPowerShell=$false } @('GET /v1.0/policies/authorizationPolicy') 'Block MSOL PowerShell unless legacy operational dependencies remain.'
+        }
     }
 
     $domains = @(GetRealRows @(ReadEvidenceTable 'domains'))
@@ -999,6 +1241,13 @@ function New-EntraSharkFindingsFromEvidence {
     if ($permissions.Count -gt 0) {
         AddEvidenceFinding 'ES-APPS-009' 'Info' 'Permissions' 'Application and delegated permissions were normalised' 'OAuth grants and app role assignments were normalised into a single permissions review table.' (@{ permissionRowCount=$permissions.Count; sample=@($permissions | Select-Object -First 50) }) @('GET /v1.0/oauth2PermissionGrants', 'GET /v1.0/servicePrincipals/{id}/appRoleAssignments') 'Use the permissions table to review delegated and application permissions by principal and resource.'
     }
+    $permissionEstimates = @(GetRealRows @(ReadEvidenceTable 'user-permission-estimates'))
+    $allowedPermissionEstimates = @($permissionEstimates | Where-Object { "$($_.accessDecision)" -match '(?i)^Allowed$|^Conditional$' })
+    if ($allowedPermissionEstimates.Count -gt 0) {
+        $maxRank = (@($allowedPermissionEstimates | ForEach-Object { Get-EntraSharkSeverityRank $_.severity }) | Measure-Object -Maximum).Maximum
+        $sev = if ($maxRank -ge 4) { 'Critical' } elseif ($maxRank -ge 3) { 'High' } elseif ($maxRank -ge 2) { 'Medium' } else { 'Info' }
+        AddEvidenceFinding 'ES-PERM-001' $sev 'Current User Permissions' 'Current user has high-value directory actions' 'Graph estimateAccess indicates the current user is allowed or conditionally allowed to perform high-value Entra resource actions.' (@{ allowedOrConditionalActionCount=$allowedPermissionEstimates.Count; sample=@($allowedPermissionEstimates | Select-Object resourceAction,accessDecision,description,severity,category,principalUserPrincipalName -First 50) }) @('POST /beta/roleManagement/directory/estimateAccess') 'Review role assignments, default user permissions, and scoped administrative grants for the assessed identity.'
+    }
 
     $devices = @(GetRealRows @(ReadEvidenceTable 'devices'))
     if ($devices.Count -gt 0) {
@@ -1011,8 +1260,16 @@ function New-EntraSharkFindingsFromEvidence {
 
     $ca = @(GetRealRows @(ReadEvidenceTable 'conditional-access-policies'))
     if ($ca.Count -gt 0) {
-        AddEvidenceFinding 'ES-CA-001' 'Medium' 'Conditional Access' 'Conditional Access policies are readable' 'Conditional Access policy settings are available, allowing review of MFA, device, location, and exclusion logic.' (@{ policyCount=$ca.Count; sample=@($ca | Select-Object id,displayName,state,users,applications,locations,grantControls -First 50) }) @('GET /v1.0/identity/conditionalAccess/policies') 'Ensure only approved roles can read policy detail and monitor policy enumeration.'
-        $disabled = @($ca | Where-Object { "$($_.state)" -match '(?i)disabled|reportOnly' } | Select-Object id,displayName,state -First 100)
+        $caView = @($ca | ConvertTo-EntraSharkConditionalAccessPolicyView)
+        $caPolicies = @($caView | Where-Object {
+            "$($_.policyTypeName)" -match 'Conditional Access' -or
+            (Get-EntraSharkProperty -InputObject $_ -Name 'users') -or
+            (Get-EntraSharkProperty -InputObject $_ -Name 'applications') -or
+            (Get-EntraSharkProperty -InputObject $_ -Name 'grantControls')
+        })
+        $sample = @($caView | Select-Object id,displayName,policyTypeName,source,state,users,applications,locations,platforms,clientAppTypes,risks,grantControls,sessionControls,policyDetailSummary -First 50)
+        AddEvidenceFinding 'ES-CA-001' 'Medium' 'Conditional Access' 'Conditional Access and tenant policy data is readable' 'The token can read Conditional Access or legacy tenant policy settings, allowing review of MFA, device, location, risk, and exclusion logic.' (@{ policyCount=$caView.Count; conditionalAccessPolicyCount=$caPolicies.Count; sample=$sample }) @('GET /v1.0/identity/conditionalAccess/policies', 'GET https://graph.windows.net/{tenant}/policies?api-version=1.61-internal') 'Ensure only approved roles can read policy detail and monitor policy enumeration.'
+        $disabled = @($caView | Where-Object { "$($_.state)" -match '(?i)disabled|reportOnly|reporting|report_only' } | Select-Object id,displayName,policyTypeName,state -First 100)
         if ($disabled.Count -gt 0) {
             AddEvidenceFinding 'ES-CA-002' 'Low' 'Conditional Access' 'Conditional Access policies are disabled or report-only' 'Policies in disabled or report-only state may represent intended exceptions, unfinished rollouts, or stale controls.' (@{ disabledOrReportOnlyCount=$disabled.Count; sample=$disabled }) @('GET /v1.0/identity/conditionalAccess/policies') 'Review disabled and report-only policies for continued business need and planned enforcement.'
         }
@@ -1128,8 +1385,12 @@ function New-EntraSharkEvidenceReport {
     if (Test-Path -LiteralPath $evidenceDir) {
         foreach ($csv in @(Get-ChildItem -LiteralPath $evidenceDir -Filter '*.csv' -File | Sort-Object Name)) {
             $rows = @(Import-EntraSharkCsvSafe -Path $csv.FullName)
+            $tableName = [IO.Path]::GetFileNameWithoutExtension($csv.Name)
+            if ($tableName -eq 'conditional-access-policies') {
+                $rows = @($rows | ConvertTo-EntraSharkConditionalAccessPolicyView)
+            }
             $tabs += [pscustomobject]@{
-                name = [IO.Path]::GetFileNameWithoutExtension($csv.Name)
+                name = $tableName
                 file = $csv.Name
                 rows = @($rows | Select-Object -First 1000)
                 totalRows = $rows.Count
@@ -1259,23 +1520,71 @@ function Invoke-EntraSharkTenantModule {
     $domains = Invoke-EntraSharkGraph -State $State -Module $module -Path '/domains' -Query @{ '$select' = 'id,isDefault,isInitial,isVerified,supportedServices,authenticationType' } -Paged
     $authz = Invoke-EntraSharkGraph -State $State -Module $module -Path '/policies/authorizationPolicy' -Query @{}
     $authMethods = Invoke-EntraSharkGraph -State $State -Module $module -Path '/policies/authenticationMethodsPolicy' -Query @{} -Version 'beta'
+    $me = Invoke-EntraSharkGraph -State $State -Module $module -Path '/me' -Query @{ '$select' = 'id,displayName,userPrincipalName,mail' }
+    $permissionEstimateRows = New-Object System.Collections.Generic.List[object]
+    if ($me.Success -and $me.Value) {
+        $scopeId = '/' + [string](Get-EntraSharkProperty -InputObject $me.Value -Name 'id')
+        $actionDefinitions = @(Get-EntraSharkHighValueResourceActions)
+        $estimateBody = @{
+            resourceActionAuthorizationChecks = @($actionDefinitions | ForEach-Object {
+                @{
+                    directoryScopeId = $scopeId
+                    resourceAction = $_.action
+                }
+            })
+        }
+        $estimate = Invoke-EntraSharkRest -State $State -Module $module -Method 'POST' -Uri 'https://graph.microsoft.com/beta/roleManagement/directory/estimateAccess' -AccessToken $State.GraphToken.AccessToken -Body $estimateBody
+        foreach ($check in @($estimate.Value.value)) {
+            $resourceAction = Get-EntraSharkProperty -InputObject $check -Name 'resourceAction' -Default (Get-EntraSharkProperty -InputObject $check -Name 'resourceaction')
+            $definition = Get-EntraSharkHighValueActionDefinition -Action $resourceAction
+            $permissionEstimateRows.Add([pscustomobject]@{
+                resourceAction = $resourceAction
+                accessDecision = Get-EntraSharkProperty -InputObject $check -Name 'accessDecision' -Default (Get-EntraSharkProperty -InputObject $check -Name 'accessdecision')
+                description = if ($definition) { $definition.description } else { $resourceAction }
+                severity = if ($definition) { $definition.severity } else { 'Info' }
+                category = if ($definition) { $definition.category } else { 'Directory Permission' }
+                directoryScopeId = $scopeId
+                principalId = Get-EntraSharkProperty -InputObject $me.Value -Name 'id'
+                principalName = Get-EntraSharkProperty -InputObject $me.Value -Name 'displayName'
+                principalUserPrincipalName = Get-EntraSharkProperty -InputObject $me.Value -Name 'userPrincipalName'
+                statusCode = $estimate.StatusCode
+            }) | Out-Null
+        }
+        if (-not $estimate.Success) {
+            $permissionEstimateRows.Add([pscustomobject]@{
+                resourceAction = '<estimateAccess failed>'
+                accessDecision = 'failed'
+                description = $estimate.Error
+                severity = 'Info'
+                category = 'Directory Permission'
+                directoryScopeId = $scopeId
+                principalId = Get-EntraSharkProperty -InputObject $me.Value -Name 'id'
+                principalName = Get-EntraSharkProperty -InputObject $me.Value -Name 'displayName'
+                principalUserPrincipalName = Get-EntraSharkProperty -InputObject $me.Value -Name 'userPrincipalName'
+                statusCode = $estimate.StatusCode
+            }) | Out-Null
+        }
+    }
 
     $result = [pscustomobject]@{
         organization                = $org.Items
         domains                     = $domains.Items
         authorizationPolicy         = $authz.Value
         authenticationMethodsPolicy = $authMethods.Value
+        userPermissionEstimates     = @($permissionEstimateRows.ToArray())
         access                      = @{
             organization                = $org.Success
             domains                     = $domains.Success
             authorizationPolicy         = $authz.Success
             authenticationMethodsPolicy = $authMethods.Success
+            userPermissionEstimates     = ($permissionEstimateRows.Count -gt 0)
         }
     }
 
     $State.Modules[$module] = $result
     Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
     Export-EntraSharkCsv -State $State -Name 'domains' -Rows $domains.Items | Out-Null
+    Export-EntraSharkCsv -State $State -Name 'user-permission-estimates' -Rows @($permissionEstimateRows.ToArray()) | Out-Null
 
     if ($authz.Success -and $authz.Value) {
         $policy = $authz.Value
@@ -1289,6 +1598,18 @@ function Invoke-EntraSharkTenantModule {
             Add-EntraSharkFinding -State $State -Id 'ES-TENANT-002' -Severity 'Low' -Category 'Tenant Defaults' -Title 'Default users can create security groups' -Description 'Member users can create security groups, which can complicate ownership and access review hygiene.' -Evidence @{ allowedToCreateSecurityGroups = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Restrict security group creation to approved owners.'
         }
 
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToCreateTenants') -eq $true) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-006' -Severity 'Medium' -Category 'Tenant Defaults' -Title 'Default users can create tenants' -Description 'Member users can create new tenants, which can enable unsanctioned shadow tenant workflows and confusing external identity paths.' -Evidence @{ allowedToCreateTenants = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Disable default tenant creation unless there is a defined governance process.'
+        }
+
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToReadBitlockerKeysForOwnedDevice') -eq $true) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-007' -Severity 'Medium' -Category 'Device Local Credentials' -Title 'Default users can read BitLocker keys for owned devices' -Description 'Default user role permissions allow users to read BitLocker recovery keys for devices they own.' -Evidence @{ allowedToReadBitlockerKeysForOwnedDevice = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Review whether self-service BitLocker key retrieval is appropriate for the assessed tenant.'
+        }
+
+        if ((Get-EntraSharkProperty -InputObject $perms -Name 'allowedToReadOtherUsers') -eq $true) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-008' -Severity 'Info' -Category 'Directory Exposure' -Title 'Default users can read other users' -Description 'Default user role permissions allow member users to read other user objects.' -Evidence @{ allowedToReadOtherUsers = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'If broad directory visibility is not desired, review default user permissions and directory restrictions.'
+        }
+
         $allowInvitesFrom = Get-EntraSharkProperty -InputObject $policy -Name 'allowInvitesFrom'
         if ($allowInvitesFrom -and $allowInvitesFrom -ne 'none') {
             Add-EntraSharkFinding -State $State -Id 'ES-TENANT-003' -Severity 'Medium' -Category 'External Collaboration' -Title 'Guest invitations are allowed' -Description 'A compromised member may be able to invite external identities, depending on the invite policy value.' -Evidence @{ allowInvitesFrom = $allowInvitesFrom } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Limit guest invitations to approved roles and monitor guest creation.'
@@ -1298,6 +1619,25 @@ function Invoke-EntraSharkTenantModule {
         if ($guestRole -eq '10dae51f-b6af-4016-8d66-8c2a99b929b3') {
             Add-EntraSharkFinding -State $State -Id 'ES-TENANT-004' -Severity 'High' -Category 'External Collaboration' -Title 'Guests have member-like directory access' -Description 'The guest user role is set to the default member role, giving B2B guests broad read visibility similar to internal users.' -Evidence @{ guestUserRoleId = $guestRole } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Use the restricted guest user role unless business requirements explicitly require member-equivalent guest access.'
         }
+
+        if ((Get-EntraSharkProperty -InputObject $policy -Name 'allowEmailVerifiedUsersToJoinOrganization') -eq $true) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-009' -Severity 'Low' -Category 'External Collaboration' -Title 'Email-verified users can join the organization' -Description 'The authorization policy allows email-verified users to join the organization, which should be explicitly governed.' -Evidence @{ allowEmailVerifiedUsersToJoinOrganization = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Review external collaboration and self-service join settings.'
+        }
+
+        if ((Get-EntraSharkProperty -InputObject $policy -Name 'allowUserConsentForRiskyApps') -eq $true) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-010' -Severity 'High' -Category 'OAuth Consent' -Title 'Users can consent to risky applications' -Description 'The tenant authorization policy allows user consent for risky apps.' -Evidence @{ allowUserConsentForRiskyApps = $true } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Disable risky app user consent and route application consent through admin approval.'
+        }
+
+        if ((Get-EntraSharkProperty -InputObject $policy -Name 'blockMsolPowerShell') -eq $false) {
+            Add-EntraSharkFinding -State $State -Id 'ES-TENANT-011' -Severity 'Low' -Category 'Legacy Administration' -Title 'MSOL PowerShell is not blocked' -Description 'Legacy MSOL PowerShell access is not blocked by authorization policy, leaving an older administration surface available.' -Evidence @{ blockMsolPowerShell = $false } -ApiCalls @('GET /v1.0/policies/authorizationPolicy') -Remediation 'Block MSOL PowerShell unless legacy operational dependencies remain.'
+        }
+    }
+
+    $allowedPermissionEstimates = @($permissionEstimateRows.ToArray() | Where-Object { "$($_.accessDecision)" -match '(?i)^Allowed$|^Conditional$' })
+    if ($allowedPermissionEstimates.Count -gt 0) {
+        $maxRank = (@($allowedPermissionEstimates | ForEach-Object { Get-EntraSharkSeverityRank $_.severity }) | Measure-Object -Maximum).Maximum
+        $sev = if ($maxRank -ge 4) { 'Critical' } elseif ($maxRank -ge 3) { 'High' } elseif ($maxRank -ge 2) { 'Medium' } else { 'Info' }
+        Add-EntraSharkFinding -State $State -Id 'ES-PERM-001' -Severity $sev -Category 'Current User Permissions' -Title 'Current user has high-value directory actions' -Description 'Graph estimateAccess indicates the current user is allowed or conditionally allowed to perform high-value Entra resource actions.' -Evidence @{ allowedOrConditionalActionCount = $allowedPermissionEstimates.Count; sample = @($allowedPermissionEstimates | Select-Object resourceAction,accessDecision,description,severity,category -First 50) } -ApiCalls @('POST /beta/roleManagement/directory/estimateAccess') -Remediation 'Review role assignments, default user permissions, and scoped administrative grants for the assessed identity.'
     }
 
     if ($domains.Success) {
@@ -2070,24 +2410,8 @@ function Invoke-EntraSharkConditionalAccessModule {
     $State.Modules[$module] = $result
     Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
     $policyRows = foreach ($policy in @($policies.Items)) {
-        [pscustomobject]@{
-            id = if ($legacySource) { Get-EntraSharkProperty -InputObject $policy -Name 'objectId' -Default (Get-EntraSharkProperty -InputObject $policy -Name 'id') } else { Get-EntraSharkProperty -InputObject $policy -Name 'id' }
-            displayName = Get-EntraSharkProperty -InputObject $policy -Name 'displayName'
-            state = Get-EntraSharkProperty -InputObject $policy -Name 'state'
-            policyType = Get-EntraSharkProperty -InputObject $policy -Name 'policyType'
-            createdDateTime = Get-EntraSharkProperty -InputObject $policy -Name 'createdDateTime'
-            modifiedDateTime = Get-EntraSharkProperty -InputObject $policy -Name 'modifiedDateTime'
-            conditions = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'conditions')
-            grantControls = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'grantControls')
-            sessionControls = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject $policy -Name 'sessionControls')
-            users = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'users')
-            applications = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'applications')
-            platforms = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'platforms')
-            locations = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'locations')
-            clientAppTypes = ConvertTo-EntraSharkDbString (Get-EntraSharkProperty -InputObject (Get-EntraSharkProperty -InputObject $policy -Name 'conditions') -Name 'clientAppTypes')
-            rawPolicy = ConvertTo-EntraSharkDbString $policy
-            source = if ($legacySource) { 'AzureADGraphLegacy' } else { 'MicrosoftGraph' }
-        }
+        $source = if ($legacySource) { 'AzureADGraphLegacy' } else { 'MicrosoftGraph' }
+        ConvertTo-EntraSharkConditionalAccessPolicyView -Policy $policy -Source $source
     }
     Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows @($policyRows) | Out-Null
 
@@ -3134,4 +3458,4 @@ function Invoke-EntraShark {
     }
 }
 
-Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep, Merge-EntraSharkRunArtifactSet, New-EntraSharkEvidenceReport, New-EntraSharkFindingsFromEvidence
+Export-ModuleMember -Function Invoke-EntraShark, Get-EntraSharkToken, Invoke-EntraSharkTokenSweep, Merge-EntraSharkRunArtifactSet, New-EntraSharkEvidenceReport, New-EntraSharkFindingsFromEvidence, ConvertTo-EntraSharkConditionalAccessPolicyView

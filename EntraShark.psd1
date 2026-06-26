@@ -13,7 +13,8 @@
         'Invoke-EntraSharkTokenSweep',
         'Merge-EntraSharkRunArtifactSet',
         'New-EntraSharkEvidenceReport',
-        'New-EntraSharkFindingsFromEvidence'
+        'New-EntraSharkFindingsFromEvidence',
+        'ConvertTo-EntraSharkConditionalAccessPolicyView'
     )
     CmdletsToExport   = @()
     VariablesToExport = '*'
