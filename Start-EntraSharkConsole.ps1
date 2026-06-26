@@ -2013,14 +2013,14 @@ function Get-ConsoleHtml {
 <head>
 <meta charset="utf-8">
 <title>EntraShark Console</title>
-<link rel="icon" href="/favicon.ico">
+<link rel="icon" href="/favicon.ico?v=2">
 <style>
 :root { --nav:#0b2239; --accent:#0c4a75; --line:#d8e1ec; --bg:#f4f7fb; --text:#16202c; --ok:#157347; --warn:#b45309; --bad:#b42318; }
 body { margin: 0; font-family: Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
 .shell { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
 aside { background: var(--nav); color: white; padding: 18px 14px; display:flex; flex-direction:column; }
 aside h1 { display:flex; align-items:center; gap:9px; font-size: 22px; margin: 0 0 18px; }
-.brandLogo { width:34px; height:34px; object-fit:contain; border-radius:6px; }
+.brandLogo { width:48px; height:auto; object-fit:contain; border-radius:6px; flex:0 0 auto; }
 .sidebarFoot { margin-top:auto; padding:14px 4px 2px; color:#cbd5e1; font-size:12px; }
 .nav button { display: block; width: 100%; text-align: left; margin: 5px 0; padding: 10px; border: 0; border-radius: 7px; background: rgba(255,255,255,.08); color: white; cursor: pointer; }
 .nav button.active { background: #1e6091; }
@@ -2102,7 +2102,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <body>
 <div class="shell">
 <aside>
-<h1><img class="brandLogo" src="/assets/logo.png" alt="">EntraShark</h1>
+<h1><img class="brandLogo" src="/assets/logo.png?v=2" alt="">EntraShark</h1>
 <div class="nav">
 <button class="active" onclick="showPanel('overview', this)">Overview</button>
 <button onclick="showPanel('auth', this)">Authentication</button>
