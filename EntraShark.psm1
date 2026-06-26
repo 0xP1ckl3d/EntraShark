@@ -2373,10 +2373,14 @@ function Invoke-EntraSharkConditionalAccessModule {
     $locations = Invoke-EntraSharkGraph -State $State -Module $module -Path '/identity/conditionalAccess/namedLocations' -Query @{ '$top' = 999 } -Paged
     $legacyPolicies = @()
     $legacySource = $null
+    $legacyFallbackSkipped = $null
 
     if (-not $policies.Success) {
         $aadToken = Get-EntraSharkToken -VariableName 'aadGraphTokens'
-        if ($aadToken) {
+        if ($aadToken -and $aadToken.ExpiresLocal -and ([datetime]$aadToken.ExpiresLocal -le (Get-Date).AddMinutes(1))) {
+            $legacyFallbackSkipped = 'Azure AD Graph legacy Conditional Access fallback was skipped because $aadGraphTokens is expired. Refresh/acquire an Azure AD Graph token for https://graph.windows.net and rerun Conditional Access collection.'
+            Write-EntraSharkStatus -State $State -Message $legacyFallbackSkipped -Color Yellow
+        } elseif ($aadToken) {
             Write-EntraSharkStatus -State $State -Message 'Microsoft Graph Conditional Access read failed; trying Azure AD Graph legacy policy endpoint with aadGraphTokens.' -Color Yellow
             $tenantSegment = if ($State.TenantId) { $State.TenantId } else { 'myorganization' }
             $legacyUri = "https://graph.windows.net/$tenantSegment/policies?api-version=1.61-internal"
@@ -2397,13 +2401,16 @@ function Invoke-EntraSharkConditionalAccessModule {
                     Uri = $legacy.Uri
                 }
             }
+        } else {
+            $legacyFallbackSkipped = 'Azure AD Graph legacy Conditional Access fallback was skipped because $aadGraphTokens is missing. Refresh/acquire an Azure AD Graph token for https://graph.windows.net and rerun Conditional Access collection if legacy fallback coverage is required.'
+            Write-EntraSharkStatus -State $State -Message $legacyFallbackSkipped -Color Yellow
         }
     }
 
     $result = [pscustomobject]@{
         policies       = $policies.Items
         namedLocations = $locations.Items
-        access         = @{ policies = $policies.Success; namedLocations = $locations.Success; legacyPolicyFallback = [bool]$legacySource }
+        access         = @{ policies = $policies.Success; namedLocations = $locations.Success; legacyPolicyFallback = [bool]$legacySource; legacyPolicyFallbackSkipped = $legacyFallbackSkipped }
         legacyPolicySource = $legacySource
     }
 
@@ -2414,6 +2421,13 @@ function Invoke-EntraSharkConditionalAccessModule {
         ConvertTo-EntraSharkConditionalAccessPolicyView -Policy $policy -Source $source
     }
     Export-EntraSharkCsv -State $State -Name 'conditional-access-policies' -Rows @($policyRows) | Out-Null
+    if ($legacyFallbackSkipped) {
+        Export-EntraSharkCsv -State $State -Name 'conditional-access-legacy-fallback' -Rows @([pscustomobject]@{
+            status = if ($aadToken) { 'expired-token' } else { 'missing-token' }
+            detail = $legacyFallbackSkipped
+            collectedAt = (Get-Date).ToString('o')
+        }) | Out-Null
+    }
 
     if ($policies.Success) {
         $apiLabel = if ($legacySource) { 'GET https://graph.windows.net/{tenant}/policies?api-version=1.61-internal' } else { 'GET /v1.0/identity/conditionalAccess/policies' }
@@ -2673,7 +2687,7 @@ function Invoke-EntraSharkArmModule {
         $result = [pscustomobject]@{ skipped = $true; reason = 'No ARM token available' }
         $State.Modules[$module] = $result
         Save-EntraSharkJson -State $State -Name $module -Value $result | Out-Null
-        $marker = [pscustomobject]@{ status = 'skipped'; detail = 'No ARM token available for this run. Refresh/acquire an ARM audience token and rerun ARM collection.'; collectedAt = (Get-Date).ToString('o') }
+        $marker = [pscustomobject]@{ status = 'missing-token'; detail = 'No ARM token available for this run. Refresh/acquire an ARM audience token for https://management.azure.com and rerun ARM collection.'; collectedAt = (Get-Date).ToString('o') }
         foreach ($datasetName in @('arm-subscriptions','arm-resource-groups','arm-resources','arm-role-assignments','arm-role-definitions')) {
             Export-EntraSharkCsv -State $State -Name $datasetName -Rows @($marker) | Out-Null
         }

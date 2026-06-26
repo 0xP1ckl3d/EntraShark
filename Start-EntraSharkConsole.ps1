@@ -794,17 +794,30 @@ $interactiveAuthJob = {
     function WriteDatasetMarker {
         param([string]$Dataset, [string]$Reason, [string]$Detail)
         if (-not $Dataset) { return $null }
-        $csv = Join-Path (Join-Path $run 'evidence') "$Dataset.csv"
-        [pscustomobject]@{
+        $marker = [pscustomobject]@{
             status = $Reason
             detail = $Detail
             collectedAt = (Get-Date).ToString('o')
-        } | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        }
+        $statusDir = Join-Path $run 'evidence-status'
+        New-Item -ItemType Directory -Force -Path $statusDir | Out-Null
+        $marker | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $statusDir "$Dataset.json") -Encoding UTF8
+        $csv = Join-Path (Join-Path $run 'evidence') "$Dataset.csv"
+        if (-not (Test-Path -LiteralPath $csv)) {
+            $marker | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        }
         Log "Wrote dataset marker for $Dataset`: $Reason - $Detail"
         return $csv
     }
+    function GetAccessTokenValue($TokenObject) {
+        if (-not $TokenObject) { return $null }
+        if ($TokenObject -is [string]) { return [string]$TokenObject }
+        if ($TokenObject.PSObject.Properties['access_token']) { return [string]$TokenObject.access_token }
+        if ($TokenObject.PSObject.Properties['AccessToken']) { return [string]$TokenObject.AccessToken }
+        return $null
+    }
     function TestAccessTokenExpired($TokenObject) {
-        $accessToken = if ($TokenObject -and $TokenObject.PSObject.Properties['access_token']) { [string]$TokenObject.access_token } else { $null }
+        $accessToken = GetAccessTokenValue $TokenObject
         if (-not $accessToken) { return $false }
         try {
             $parts = $accessToken.Split('.')
@@ -819,6 +832,36 @@ $interactiveAuthJob = {
         } catch {}
         return $false
     }
+    function GetTokenPreflightIssue {
+        param([object]$TokenObject, [string]$VariableName, [string]$AudienceLabel)
+        if (-not $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'missing-token'
+                detail = "Missing $AudienceLabel token (`$$VariableName`) in the current run token vault. Acquire or refresh a token for this audience before running this action."
+            }
+        }
+        if (-not (GetAccessTokenValue $TokenObject)) {
+            return [pscustomobject]@{
+                reason = 'invalid-token'
+                detail = "$AudienceLabel token (`$$VariableName`) exists but does not contain an access token. Re-acquire or refresh this token before running this action."
+            }
+        }
+        if (TestAccessTokenExpired $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'expired-token'
+                detail = "$AudienceLabel token (`$$VariableName`) is expired or expires within one minute. Refresh this token before running this action."
+            }
+        }
+        return $null
+    }
+    function AssertRunToken {
+        param([object]$TokenObject, [string]$VariableName, [string]$AudienceLabel, [string]$Dataset)
+        $issue = GetTokenPreflightIssue -TokenObject $TokenObject -VariableName $VariableName -AudienceLabel $AudienceLabel
+        if ($issue) {
+            if ($Dataset) { WriteDatasetMarker -Dataset $Dataset -Reason $issue.reason -Detail $issue.detail | Out-Null }
+            throw $issue.detail
+        }
+    }
     function GetDatasetRealRowCount {
         param([string]$RunDir, [string]$Dataset)
         if (-not $Dataset) { return 0 }
@@ -826,7 +869,7 @@ $interactiveAuthJob = {
         if (-not (Test-Path -LiteralPath $csv)) { return 0 }
         $rows = @(Import-Csv -LiteralPath $csv)
         return @($rows | Where-Object {
-            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|failed-\d+)$')
+            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|missing-token|expired-token|invalid-token|failed-\d+)$')
         }).Count
     }
     function GetCollectionFailure {
@@ -1137,12 +1180,75 @@ $reconJob = {
     Import-Module $ModulePath -Force
     function SaveTask($t) { $t | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $t.dir 'task.json') -Encoding UTF8 }
     function Log($msg) { [pscustomobject]@{ timestamp=(Get-Date).ToString('o'); message=$msg } | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $Task.dir 'status.jsonl') -Encoding UTF8 }
+    function GetAccessTokenValue($TokenObject) {
+        if (-not $TokenObject) { return $null }
+        if ($TokenObject -is [string]) { return [string]$TokenObject }
+        if ($TokenObject.PSObject.Properties['access_token']) { return [string]$TokenObject.access_token }
+        if ($TokenObject.PSObject.Properties['AccessToken']) { return [string]$TokenObject.AccessToken }
+        return $null
+    }
+    function TestAccessTokenExpired($TokenObject) {
+        $accessToken = GetAccessTokenValue $TokenObject
+        if (-not $accessToken) { return $false }
+        try {
+            $parts = $accessToken.Split('.')
+            if ($parts.Count -lt 2) { return $false }
+            $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+            $payload += '=' * ((4 - $payload.Length % 4) % 4)
+            $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($json.exp) {
+                $expires = [DateTimeOffset]::FromUnixTimeSeconds([int64]$json.exp)
+                return ($expires -le [DateTimeOffset]::UtcNow.AddMinutes(1))
+            }
+        } catch {}
+        return $false
+    }
+    function GetTokenPreflightIssue {
+        param([object]$TokenObject, [string]$VariableName, [string]$AudienceLabel)
+        if (-not $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'missing-token'
+                detail = "Missing $AudienceLabel token (`$$VariableName`) in the current run token vault. Acquire or refresh a token for this audience before running this collection."
+            }
+        }
+        if (-not (GetAccessTokenValue $TokenObject)) {
+            return [pscustomobject]@{
+                reason = 'invalid-token'
+                detail = "$AudienceLabel token (`$$VariableName`) exists but does not contain an access token. Re-acquire or refresh this token before running this collection."
+            }
+        }
+        if (TestAccessTokenExpired $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'expired-token'
+                detail = "$AudienceLabel token (`$$VariableName`) is expired or expires within one minute. Refresh this token before running this collection."
+            }
+        }
+        return $null
+    }
+    function WriteReconDatasetMarker {
+        param([string]$RunDir, [string]$Dataset, [string]$Reason, [string]$Detail)
+        if (-not $RunDir -or -not $Dataset) { return }
+        $evidenceDir = Join-Path $RunDir 'evidence'
+        $statusDir = Join-Path $RunDir 'evidence-status'
+        New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $statusDir | Out-Null
+        $marker = [pscustomobject]@{
+            status = $Reason
+            detail = $Detail
+            collectedAt = (Get-Date).ToString('o')
+        }
+        $marker | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $statusDir "$Dataset.json") -Encoding UTF8
+        $csv = Join-Path $evidenceDir "$Dataset.csv"
+        if (-not (Test-Path -LiteralPath $csv)) {
+            $marker | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        }
+        Log "Marked $Dataset as $Reason - $Detail"
+    }
     $Task.state='running'; $Task.started=(Get-Date).ToString('o'); $Task.message='Starting recon'; SaveTask $Task
     try {
         $vaultObj = Get-Content -LiteralPath $TokenVaultPath -Raw | ConvertFrom-Json
         foreach ($p in $vaultObj.PSObject.Properties) { Set-Variable -Name $p.Name -Scope Global -Value $p.Value }
         if (-not $global:tokens -and $global:graphTokens) { $global:tokens = $global:graphTokens }
-        if (-not $global:tokens) { throw 'No Graph token in token vault. Acquire token first.' }
         $existingRun = if (Test-Path -LiteralPath $CurrentRunPath) { (Get-Content -LiteralPath $CurrentRunPath -Raw).Trim() } else { $null }
         if ($existingRun -and (Test-Path -LiteralPath $existingRun)) {
             $runDir = $existingRun
@@ -1151,11 +1257,31 @@ $reconJob = {
             $runDir = Join-Path $OutputRoot ("console-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
             Log "Creating run directory: $runDir"
         }
+        New-Item -ItemType Directory -Force -Path (Join-Path $runDir 'evidence') | Out-Null
+        $graphIssue = GetTokenPreflightIssue -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph'
+        if ($graphIssue) { throw $graphIssue.detail }
         $statusPath = Join-Path $Task.dir 'status.jsonl'
         $tempRun = Join-Path $Task.dir 'isolated-recon'
         $params = @{ OutputDirectory=$tempRun; StatusPath=$statusPath; Quiet=$true; IncludeM365Search=[bool]$Recon.includeM365Search }
         if ($Recon.tenant) { $params.TenantId = $Recon.tenant }
-        if ($Recon.modules -and @($Recon.modules).Count -gt 0) { $params.Modules = [string[]]$Recon.modules }
+        $modules = if ($Recon.modules -and @($Recon.modules).Count -gt 0) {
+            @([string[]]$Recon.modules)
+        } else {
+            @('tenant','users','auth','roles','administrativeUnits','groups','apps','devices','conditionalAccess','m365','arm','correlator')
+        }
+        if ($modules -contains 'arm') {
+            $armIssue = GetTokenPreflightIssue -TokenObject $global:armTokens -VariableName 'armTokens' -AudienceLabel 'Azure Resource Manager'
+            if ($armIssue) {
+                $detail = "$($armIssue.detail) ARM recon was skipped for this bulk run. Refresh/acquire `$armTokens for https://management.azure.com and rerun ARM collection for Azure-plane coverage."
+                foreach ($datasetName in @('arm-subscriptions','arm-resource-groups','arm-resources','arm-role-assignments','arm-role-definitions','db-arm-role-definitions')) {
+                    WriteReconDatasetMarker -RunDir $runDir -Dataset $datasetName -Reason $armIssue.reason -Detail $detail
+                }
+                Log $detail
+                $modules = @($modules | Where-Object { $_ -ne 'arm' })
+            }
+        }
+        if ($modules.Count -eq 0) { throw 'No collection modules can run with the current token set. Acquire the missing audience token(s) and try again.' }
+        $params.Modules = [string[]]$modules
         $result = Invoke-EntraShark @params
         $merge = Merge-EntraSharkRunArtifactSet -TargetRun $runDir -TempRun $result.OutputDirectory
         $Task.state='completed'; $Task.completed=(Get-Date).ToString('o'); $Task.message='Recon complete'; $Task.result=[ordered]@{ outputDirectory=$runDir; tempRun=$result.OutputDirectory; findingCount=$result.Findings.Count; report=$merge.Report; modules=$result.Modules; mergedEvidenceFiles=$merge.MergedEvidenceFiles; reportTables=$merge.TableCount; reportRows=$merge.RowCount }; SaveTask $Task
@@ -1285,17 +1411,30 @@ $attackJob = {
     function WriteDatasetMarker {
         param([string]$Dataset, [string]$Reason, [string]$Detail)
         if (-not $Dataset) { return $null }
-        $csv = Join-Path (Join-Path $run 'evidence') "$Dataset.csv"
-        [pscustomobject]@{
+        $marker = [pscustomobject]@{
             status = $Reason
             detail = $Detail
             collectedAt = (Get-Date).ToString('o')
-        } | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        }
+        $statusDir = Join-Path $run 'evidence-status'
+        New-Item -ItemType Directory -Force -Path $statusDir | Out-Null
+        $marker | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $statusDir "$Dataset.json") -Encoding UTF8
+        $csv = Join-Path (Join-Path $run 'evidence') "$Dataset.csv"
+        if (-not (Test-Path -LiteralPath $csv)) {
+            $marker | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+        }
         Log "Wrote dataset marker for $Dataset`: $Reason - $Detail"
         return $csv
     }
+    function GetAccessTokenValue($TokenObject) {
+        if (-not $TokenObject) { return $null }
+        if ($TokenObject -is [string]) { return [string]$TokenObject }
+        if ($TokenObject.PSObject.Properties['access_token']) { return [string]$TokenObject.access_token }
+        if ($TokenObject.PSObject.Properties['AccessToken']) { return [string]$TokenObject.AccessToken }
+        return $null
+    }
     function TestAccessTokenExpired($TokenObject) {
-        $accessToken = if ($TokenObject -and $TokenObject.PSObject.Properties['access_token']) { [string]$TokenObject.access_token } else { $null }
+        $accessToken = GetAccessTokenValue $TokenObject
         if (-not $accessToken) { return $false }
         try {
             $parts = $accessToken.Split('.')
@@ -1310,6 +1449,36 @@ $attackJob = {
         } catch {}
         return $false
     }
+    function GetTokenPreflightIssue {
+        param([object]$TokenObject, [string]$VariableName, [string]$AudienceLabel)
+        if (-not $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'missing-token'
+                detail = "Missing $AudienceLabel token (`$$VariableName`) in the current run token vault. Acquire or refresh a token for this audience before running this action."
+            }
+        }
+        if (-not (GetAccessTokenValue $TokenObject)) {
+            return [pscustomobject]@{
+                reason = 'invalid-token'
+                detail = "$AudienceLabel token (`$$VariableName`) exists but does not contain an access token. Re-acquire or refresh this token before running this action."
+            }
+        }
+        if (TestAccessTokenExpired $TokenObject) {
+            return [pscustomobject]@{
+                reason = 'expired-token'
+                detail = "$AudienceLabel token (`$$VariableName`) is expired or expires within one minute. Refresh this token before running this action."
+            }
+        }
+        return $null
+    }
+    function AssertRunToken {
+        param([object]$TokenObject, [string]$VariableName, [string]$AudienceLabel, [string]$Dataset)
+        $issue = GetTokenPreflightIssue -TokenObject $TokenObject -VariableName $VariableName -AudienceLabel $AudienceLabel
+        if ($issue) {
+            if ($Dataset) { WriteDatasetMarker -Dataset $Dataset -Reason $issue.reason -Detail $issue.detail | Out-Null }
+            throw $issue.detail
+        }
+    }
     function GetDatasetRealRowCount {
         param([string]$RunDir, [string]$Dataset)
         if (-not $Dataset) { return 0 }
@@ -1317,7 +1486,7 @@ $attackJob = {
         if (-not (Test-Path -LiteralPath $csv)) { return 0 }
         $rows = @(Import-Csv -LiteralPath $csv)
         return @($rows | Where-Object {
-            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|failed-\d+)$')
+            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|missing-token|expired-token|invalid-token|failed-\d+)$')
         }).Count
     }
     function GetCollectionFailure {
@@ -1442,6 +1611,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             [string]$RawName,
             [int]$Size = 50
         )
+        AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset ([IO.Path]::GetFileNameWithoutExtension($CsvName))
         $token = Get-EntraSharkToken -Token $global:tokens
         if (-not $token) { throw 'No Graph token available for Microsoft Search.' }
         $request = @{ entityTypes=$EntityTypes; query=@{ queryString=$Query }; from=0; size=$Size }
@@ -1495,6 +1665,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
     }
     function InvokeRecentMail {
         param([int]$Count)
+        AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset 'email-search-results'
         $token = Get-EntraSharkToken -Token $global:tokens
         if (-not $token) { throw 'No Graph token available for mail extraction.' }
         $top = [Math]::Max(1, [Math]::Min($Count, 500))
@@ -1520,6 +1691,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
     }
     function InvokeRecentTeams {
         param([int]$Count)
+        AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset 'teams-search-results'
         $token = Get-EntraSharkToken -Token $global:tokens
         if (-not $token) { throw 'No Graph token available for Teams extraction.' }
         $top = [Math]::Max(1, [Math]::Min($Count, 100))
@@ -1544,6 +1716,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         return [ordered]@{ output=$out; evidence=$csv; rows=@($rows).Count; mode='recent'; count=$top }
     }
     function InvokeDeviceOwnerMap {
+        AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset 'device-owner-map'
         $token = Get-EntraSharkToken -Token $global:tokens
         if (-not $token) { throw 'No Graph token available for device owner mapping.' }
         $headers = @{ Authorization="Bearer $($token.AccessToken)" }
@@ -1596,6 +1769,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         New-Item -ItemType Directory -Force -Path (Join-Path $run 'raw') | Out-Null
         New-Item -ItemType Directory -Force -Path (Join-Path $run 'evidence') | Out-Null
         if ($Attack.kind -eq 'updatableGroups') {
+            AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset 'updatable-groups'
             . $ToolPath
             Log 'Running updatable group probe'
             $resultObject = Test-GraphGroupWriteAccess -PassThru
@@ -1628,11 +1802,10 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             $modules = @($Attack.modules | Where-Object { $_ })
             if (-not $modules.Count) { throw 'No modules were provided for isolated collection.' }
             if (($modules | Where-Object { $_ -ne 'arm' }).Count -gt 0) {
-                if (-not $global:tokens) { throw 'No Graph token in the current run token vault. Acquire or load a Graph token first.' }
-                if (TestAccessTokenExpired $global:tokens) { throw 'Graph token is expired or expires within one minute. Refresh the token before running this collection.' }
+                AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset ([string]$Attack.dataset)
             }
-            if (($modules | Where-Object { $_ -eq 'arm' }).Count -gt 0 -and $global:armTokens -and (TestAccessTokenExpired $global:armTokens)) {
-                throw 'ARM token is expired or expires within one minute. Refresh the ARM token before running this collection.'
+            if (($modules | Where-Object { $_ -eq 'arm' }).Count -gt 0) {
+                AssertRunToken -TokenObject $global:armTokens -VariableName 'armTokens' -AudienceLabel 'Azure Resource Manager' -Dataset ([string]$Attack.dataset)
             }
             Log "Running isolated collection module(s): $($modules -join ', ')"
             $tempRun = Join-Path $Task.dir 'isolated-run'
@@ -1649,6 +1822,7 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             }
         } elseif ($Attack.kind -eq 'groupWrite') {
             if ($Attack.confirmText -ne 'AUTHORIZED') { throw 'Write actions require confirmation text AUTHORIZED.' }
+            AssertRunToken -TokenObject $global:tokens -VariableName 'tokens' -AudienceLabel 'Microsoft Graph' -Dataset $null
             $token = Get-EntraSharkToken -Token $global:tokens
             $headers = @{ Authorization="Bearer $($token.AccessToken)"; 'Content-Type'='application/json' }
             if ($Attack.mode -eq 'add') {
@@ -1690,6 +1864,17 @@ function Get-State {
             $tables = @(Get-ChildItem -LiteralPath $evidence -Filter '*.csv' -File | Sort-Object Name | ForEach-Object {
                 [ordered]@{ name = [IO.Path]::GetFileNameWithoutExtension($_.Name); file = $_.Name; length = $_.Length }
             })
+        }
+        $statusDir = Join-Path $run 'evidence-status'
+        if (Test-Path -LiteralPath $statusDir) {
+            $known = @{}
+            foreach ($table in @($tables)) { $known[$table.name] = $true }
+            $statusTables = @(Get-ChildItem -LiteralPath $statusDir -Filter '*.json' -File | Sort-Object Name | Where-Object {
+                -not $known.ContainsKey([IO.Path]::GetFileNameWithoutExtension($_.Name))
+            } | ForEach-Object {
+                [ordered]@{ name = [IO.Path]::GetFileNameWithoutExtension($_.Name); file = $_.Name; length = $_.Length; statusOnly = $true }
+            })
+            $tables = @($tables + $statusTables)
         }
         $taskRoot = Get-RunTaskRoot -Run $run
         if ($taskRoot -and (Test-Path -LiteralPath $taskRoot)) {
@@ -1802,6 +1987,16 @@ function Get-TableRows {
     $run = Get-CurrentRun
     if (-not $run) { throw 'No run exists yet.' }
     $path = Join-Path (Join-Path $run 'evidence') "$Name.csv"
+    $statusPath = Join-Path (Join-Path $run 'evidence-status') "$Name.json"
+    if (Test-Path -LiteralPath $statusPath) {
+        $showStatus = -not (Test-Path -LiteralPath $path)
+        if (-not $showStatus) {
+            $showStatus = ((Get-Item -LiteralPath $statusPath).LastWriteTimeUtc -ge (Get-Item -LiteralPath $path).LastWriteTimeUtc)
+        }
+        if ($showStatus) {
+            return @((Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json))
+        }
+    }
     if (-not (Test-Path -LiteralPath $path)) { throw "Unknown table $Name" }
     $rows = @(Import-Csv -LiteralPath $path | Select-Object -First 5000)
     if ($Name -eq 'conditional-access-policies') {
@@ -2025,7 +2220,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <script>
 const modules = ['tenant','users','auth','roles','administrativeUnits','groups','apps','devices','conditionalAccess','m365','arm','correlator'];
 const tableCatalog = [
-  {group:'Tenant & Policy', tables:['domains','conditional-access-policies','user-permission-estimates']},
+  {group:'Tenant & Policy', tables:['domains','conditional-access-policies','conditional-access-legacy-fallback','user-permission-estimates']},
   {group:'Identity', tables:['users','risky-users','risk-detections','role-members','pim-eligible-roles','administrative-units','administrative-unit-member-samples']},
   {group:'Groups', tables:['groups','group-owner-samples','group-member-samples','updatable-groups']},
   {group:'Applications & Permissions', tables:['applications','service-principals','application-owners','service-principal-owners','oauth2-grants','app-role-assignments','federated-identity-credentials','role-assignments']},
@@ -2067,6 +2262,7 @@ const collectActions = {
   'team-channels': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'inbox-message-rules': {kind:'collectModule', modules:['m365'], label:'Collect now'},
   'conditional-access-policies': {kind:'collectModule', modules:['conditionalAccess'], label:'Collect now'},
+  'conditional-access-legacy-fallback': {kind:'collectModule', modules:['conditionalAccess'], label:'Collect now'},
   'user-permission-estimates': {kind:'collectModule', modules:['tenant'], label:'Collect now'},
   'risky-users': {kind:'collectModule', modules:['auth'], label:'Collect now'},
   'risk-detections': {kind:'collectModule', modules:['auth'], label:'Collect now'},
@@ -2315,6 +2511,23 @@ async function loadTable(name){
 function renderCell(v){ const text=typeof v==='object'?JSON.stringify(v):String(v ?? ''); if(/^https?:\/\//i.test(text)) return `<a href="${esc(text)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`; return esc(text); }
 function sortByColumn(key){ if(sortKey===key) sortDir=sortDir==='asc'?'desc':'asc'; else { sortKey=key; sortDir='asc'; } renderTable(); }
 function filteredRows(){ const term=(document.getElementById('tableFilter').value||'').toLowerCase(); let rows=term?currentRows.filter(r=>JSON.stringify(r).toLowerCase().includes(term)):currentRows.slice(); if(sortKey){ rows.sort((a,b)=>String(a[sortKey]??'').localeCompare(String(b[sortKey]??''), undefined, {numeric:true,sensitivity:'base'})*(sortDir==='asc'?1:-1)); } return rows; }
+function markerRow(rows){
+  if(!rows || rows.length!==1) return null;
+  const r=rows[0]||{};
+  const status=String(r.status||'').toLowerCase();
+  return /^(empty|failed|denied|not-returned|skipped|missing-token|expired-token|invalid-token|failed-\d+)$/.test(status) ? r : null;
+}
+function renderDatasetMarker(row){
+  const status=String(row.status||'not-collected');
+  const detail=row.detail||'This dataset was not collected.';
+  const guidance = status==='missing-token'
+    ? 'Acquire or refresh the required audience token, then rerun this exact dataset.'
+    : status==='expired-token'
+      ? 'Refresh the expired token from the run token vault, then rerun this exact dataset.'
+      : 'Check the task log for the original collection context, then rerun this dataset when ready.';
+  document.getElementById('dataTable').innerHTML=`<tbody><tr><td><div class="empty"><h3>${esc(prettyName(currentTable||'Dataset'))} was not collected</h3><p><b>Status:</b> ${esc(status)}</p><p>${esc(detail)}</p><p>${esc(guidance)}</p></div></td></tr></tbody>`;
+  setDataStatus(`${prettyName(currentTable||'Dataset')} was not collected: ${status}.`, status!=='empty');
+}
 function renderPolicyCards(rows){
   const visible=rows.slice(0,500);
   const cards=visible.map(r=>{
@@ -2328,6 +2541,8 @@ function renderPolicyCards(rows){
 function prettyJson(value){ try{ return JSON.stringify(JSON.parse(value), null, 2); }catch(e){ return String(value??''); } }
 function renderTable(){
   const rows=filteredRows();
+  const marker=markerRow(rows);
+  if(marker){ renderDatasetMarker(marker); return; }
   if(currentTable==='conditional-access-policies'){ renderPolicyCards(rows); return; }
   const keys=[]; rows.forEach(r=>Object.keys(r||{}).forEach(k=>{ if(!keys.includes(k)) keys.push(k); }));
   if(!keys.length){ document.getElementById('dataTable').innerHTML=`<tbody><tr><td>${currentTable ? 'No rows matched this table/filter.' : 'No rows selected. Pick a collected dataset above.'}</td></tr></tbody>`; return; }
