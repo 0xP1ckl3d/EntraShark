@@ -191,6 +191,29 @@ function Send-Response {
     }
 }
 
+function Send-BinaryResponse {
+    param($Response, [byte[]]$Bytes, [string]$ContentType = 'application/octet-stream', [int]$StatusCode = 200)
+    try {
+        $reason = switch ($StatusCode) {
+            200 { 'OK' }
+            404 { 'Not Found' }
+            500 { 'Internal Server Error' }
+            default { 'OK' }
+        }
+        $header = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nConnection: close`r`n`r`n"
+        $headerBytes = [Text.Encoding]::ASCII.GetBytes($header)
+        $Response.Stream.Write($headerBytes, 0, $headerBytes.Length)
+        $Response.Stream.Write($Bytes, 0, $Bytes.Length)
+        $Response.Stream.Flush()
+    } catch [System.IO.IOException] {
+        Write-Host "[EntraShark] Client disconnected before binary response completed: $($_.Exception.Message)" -ForegroundColor DarkGray
+    } catch [System.ObjectDisposedException] {
+        Write-Host "[EntraShark] Client connection already closed." -ForegroundColor DarkGray
+    } finally {
+        try { $Response.Client.Close() } catch {}
+    }
+}
+
 function Read-Body {
     param($Request)
     $raw = $Request.Body
@@ -780,6 +803,54 @@ $interactiveAuthJob = {
         Log "Wrote dataset marker for $Dataset`: $Reason - $Detail"
         return $csv
     }
+    function TestAccessTokenExpired($TokenObject) {
+        $accessToken = if ($TokenObject -and $TokenObject.PSObject.Properties['access_token']) { [string]$TokenObject.access_token } else { $null }
+        if (-not $accessToken) { return $false }
+        try {
+            $parts = $accessToken.Split('.')
+            if ($parts.Count -lt 2) { return $false }
+            $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+            $payload += '=' * ((4 - $payload.Length % 4) % 4)
+            $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($json.exp) {
+                $expires = [DateTimeOffset]::FromUnixTimeSeconds([int64]$json.exp)
+                return ($expires -le [DateTimeOffset]::UtcNow.AddMinutes(1))
+            }
+        } catch {}
+        return $false
+    }
+    function GetDatasetRealRowCount {
+        param([string]$RunDir, [string]$Dataset)
+        if (-not $Dataset) { return 0 }
+        $csv = Join-Path (Join-Path $RunDir 'evidence') "$Dataset.csv"
+        if (-not (Test-Path -LiteralPath $csv)) { return 0 }
+        $rows = @(Import-Csv -LiteralPath $csv)
+        return @($rows | Where-Object {
+            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|failed-\d+)$')
+        }).Count
+    }
+    function GetCollectionFailure {
+        param([string]$TempRun, [string]$RequestedDataset)
+        $apiPath = Join-Path $TempRun 'api-calls.csv'
+        if (-not (Test-Path -LiteralPath $apiPath)) { return $null }
+        $calls = @(Import-Csv -LiteralPath $apiPath)
+        $failures = @($calls | Where-Object {
+            "$($_.success)" -eq 'False' -or ([int]($_.statusCode -as [int]) -ge 400)
+        })
+        if ($failures.Count -eq 0) { return $null }
+        if ($RequestedDataset -and (GetDatasetRealRowCount -RunDir $TempRun -Dataset $RequestedDataset) -gt 0) { return $null }
+        $first = $failures | Sort-Object timestamp | Select-Object -First 1
+        $status = [int]($first.statusCode -as [int])
+        $hint = switch ($status) {
+            400 { 'Bad request. The query format or endpoint parameters were rejected.' }
+            401 { 'Unauthorized. The token is expired, invalid, or not accepted for this resource.' }
+            403 { 'Forbidden. The token lacks the required permissions or role for this query.' }
+            404 { 'Not found. The endpoint or resource was not available for this tenant/token.' }
+            default { if ($status -ge 500) { 'Server-side service error returned by the API.' } else { 'The API call failed.' } }
+        }
+        $message = "Collection did not produce real rows for $RequestedDataset. $hint Status $status from $($first.method) $($first.uri). $($first.errorMessage)"
+        return [pscustomobject]@{ reason="failed-$status"; detail=$message; statusCode=$status; failedCalls=$failures.Count }
+    }
     function MergeJsonMap($Target, $Source) {
         if (-not $Source) { return }
         foreach ($p in $Source.PSObject.Properties) {
@@ -1015,7 +1086,11 @@ $refreshJob = {
             $params = $baseParams.Clone()
             $params.Resource = [string]$resource
             $params.OutVar = [string]$outVar
-            ClearTokenVariable -Name $outVar
+            if ($outVar -ne $inputVar) {
+                ClearTokenVariable -Name $outVar
+            } else {
+                Log "Refreshing in place from `$${inputVar}; preserving source variable until helper returns a replacement token."
+            }
             $resolvedResource = $resource
             $resourceKey = "$resource".ToLowerInvariant()
             if ($script:ResourceAliases -and $script:ResourceAliases.Contains($resourceKey)) { $resolvedResource = $script:ResourceAliases[$resourceKey] }
@@ -1218,6 +1293,54 @@ $attackJob = {
         } | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
         Log "Wrote dataset marker for $Dataset`: $Reason - $Detail"
         return $csv
+    }
+    function TestAccessTokenExpired($TokenObject) {
+        $accessToken = if ($TokenObject -and $TokenObject.PSObject.Properties['access_token']) { [string]$TokenObject.access_token } else { $null }
+        if (-not $accessToken) { return $false }
+        try {
+            $parts = $accessToken.Split('.')
+            if ($parts.Count -lt 2) { return $false }
+            $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+            $payload += '=' * ((4 - $payload.Length % 4) % 4)
+            $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($json.exp) {
+                $expires = [DateTimeOffset]::FromUnixTimeSeconds([int64]$json.exp)
+                return ($expires -le [DateTimeOffset]::UtcNow.AddMinutes(1))
+            }
+        } catch {}
+        return $false
+    }
+    function GetDatasetRealRowCount {
+        param([string]$RunDir, [string]$Dataset)
+        if (-not $Dataset) { return 0 }
+        $csv = Join-Path (Join-Path $RunDir 'evidence') "$Dataset.csv"
+        if (-not (Test-Path -LiteralPath $csv)) { return 0 }
+        $rows = @(Import-Csv -LiteralPath $csv)
+        return @($rows | Where-Object {
+            -not ($_.PSObject.Properties.Name -contains 'status' -and "$($_.status)" -match '^(empty|failed|denied|not-returned|skipped|failed-\d+)$')
+        }).Count
+    }
+    function GetCollectionFailure {
+        param([string]$TempRun, [string]$RequestedDataset)
+        $apiPath = Join-Path $TempRun 'api-calls.csv'
+        if (-not (Test-Path -LiteralPath $apiPath)) { return $null }
+        $calls = @(Import-Csv -LiteralPath $apiPath)
+        $failures = @($calls | Where-Object {
+            "$($_.success)" -eq 'False' -or ([int]($_.statusCode -as [int]) -ge 400)
+        })
+        if ($failures.Count -eq 0) { return $null }
+        if ($RequestedDataset -and (GetDatasetRealRowCount -RunDir $TempRun -Dataset $RequestedDataset) -gt 0) { return $null }
+        $first = $failures | Sort-Object timestamp | Select-Object -First 1
+        $status = [int]($first.statusCode -as [int])
+        $hint = switch ($status) {
+            400 { 'Bad request. The query format or endpoint parameters were rejected.' }
+            401 { 'Unauthorized. The token is expired, invalid, or not accepted for this resource.' }
+            403 { 'Forbidden. The token lacks the required permissions or role for this query.' }
+            404 { 'Not found. The endpoint or resource was not available for this tenant/token.' }
+            default { if ($status -ge 500) { 'Server-side service error returned by the API.' } else { 'The API call failed.' } }
+        }
+        $message = "Collection did not produce real rows for $RequestedDataset. $hint Status $status from $($first.method) $($first.uri). $($first.errorMessage)"
+        return [pscustomobject]@{ reason="failed-$status"; detail=$message; statusCode=$status; failedCalls=$failures.Count }
     }
     function MergeJsonMap($Target, $Source) {
         if (-not $Source) { return }
@@ -1504,6 +1627,13 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
         } elseif ($Attack.kind -eq 'collectModule') {
             $modules = @($Attack.modules | Where-Object { $_ })
             if (-not $modules.Count) { throw 'No modules were provided for isolated collection.' }
+            if (($modules | Where-Object { $_ -ne 'arm' }).Count -gt 0) {
+                if (-not $global:tokens) { throw 'No Graph token in the current run token vault. Acquire or load a Graph token first.' }
+                if (TestAccessTokenExpired $global:tokens) { throw 'Graph token is expired or expires within one minute. Refresh the token before running this collection.' }
+            }
+            if (($modules | Where-Object { $_ -eq 'arm' }).Count -gt 0 -and $global:armTokens -and (TestAccessTokenExpired $global:armTokens)) {
+                throw 'ARM token is expired or expires within one minute. Refresh the ARM token before running this collection.'
+            }
             Log "Running isolated collection module(s): $($modules -join ', ')"
             $tempRun = Join-Path $Task.dir 'isolated-run'
             $params = @{ OutputDirectory=$tempRun; Quiet=$true; Modules=([string[]]$modules) }
@@ -1511,6 +1641,12 @@ const tabs=JSON.parse(document.getElementById('data').textContent||'[]');let cur
             $merge = Merge-EntraSharkRunArtifactSet -TargetRun $run -TempRun $result.OutputDirectory -RequestedDataset ([string]$Attack.dataset)
             $Task.result=[ordered]@{ outputDirectory=$run; tempRun=$result.OutputDirectory; modules=$result.Modules; findingCount=$result.Findings.Count; mergedEvidenceFiles=$merge.MergedEvidenceFiles; report=$merge.Report; reportTables=$merge.TableCount; reportRows=$merge.RowCount }
             Log "Isolated collection merged $($merge.MergedEvidenceFiles) evidence operation(s) into active run and regenerated report"
+            $failure = GetCollectionFailure -TempRun $result.OutputDirectory -RequestedDataset ([string]$Attack.dataset)
+            if ($failure) {
+                WriteDatasetMarker -Dataset ([string]$Attack.dataset) -Reason $failure.reason -Detail $failure.detail | Out-Null
+                New-EntraSharkFindingsFromEvidence -Run $run | Out-Null
+                throw $failure.detail
+            }
         } elseif ($Attack.kind -eq 'groupWrite') {
             if ($Attack.confirmText -ne 'AUTHORIZED') { throw 'Write actions require confirmation text AUTHORIZED.' }
             $token = Get-EntraSharkToken -Token $global:tokens
@@ -1682,12 +1818,15 @@ function Get-ConsoleHtml {
 <head>
 <meta charset="utf-8">
 <title>EntraShark Console</title>
+<link rel="icon" href="/favicon.ico">
 <style>
 :root { --nav:#0b2239; --accent:#0c4a75; --line:#d8e1ec; --bg:#f4f7fb; --text:#16202c; --ok:#157347; --warn:#b45309; --bad:#b42318; }
 body { margin: 0; font-family: Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
 .shell { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
-aside { background: var(--nav); color: white; padding: 18px 14px; }
-aside h1 { font-size: 22px; margin: 0 0 18px; }
+aside { background: var(--nav); color: white; padding: 18px 14px; display:flex; flex-direction:column; }
+aside h1 { display:flex; align-items:center; gap:9px; font-size: 22px; margin: 0 0 18px; }
+.brandLogo { width:34px; height:34px; object-fit:contain; border-radius:6px; }
+.sidebarFoot { margin-top:auto; padding:14px 4px 2px; color:#cbd5e1; font-size:12px; }
 .nav button { display: block; width: 100%; text-align: left; margin: 5px 0; padding: 10px; border: 0; border-radius: 7px; background: rgba(255,255,255,.08); color: white; cursor: pointer; }
 .nav button.active { background: #1e6091; }
 main { padding: 20px; }
@@ -1768,7 +1907,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <body>
 <div class="shell">
 <aside>
-<h1>EntraShark</h1>
+<h1><img class="brandLogo" src="/assets/logo.png" alt="">EntraShark</h1>
 <div class="nav">
 <button class="active" onclick="showPanel('overview', this)">Overview</button>
 <button onclick="showPanel('auth', this)">Authentication</button>
@@ -1778,6 +1917,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <button onclick="showPanel('attacks', this)">Attack Modules</button>
 <button onclick="showPanel('logs', this)">Tasks & Logs</button>
 </div>
+<div class="sidebarFoot">Built by RedSec AU</div>
 </aside>
 <main>
 <div id="activityBar" class="activityBar"><span id="activityText">Ready.</span><span id="activityTime"></span></div>
@@ -1852,7 +1992,7 @@ th { position:sticky; top:0; background:#f8fafc; }
 <div class="tablewrap"><table id="dataTable"></table></div>
 </div>
 <div id="report" class="panel">
-<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button class="primary" onclick="startFindingDiscovery()">Discover Findings From Existing Evidence</button><button onclick="showReportFrame()">Show Frame</button><button onclick="hideReportFrame()">Hide Frame</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div class="hint"><h3>Report Finding Producers</h3><button onclick="rerunReportModule('tenant','domains')">Rerun Tenant</button><button onclick="rerunReportModule('users','users')">Rerun Users</button><button onclick="rerunReportModule('roles','role-members')">Rerun Roles/PIM</button><button onclick="rerunReportModule('groups','groups')">Rerun Groups</button><button onclick="rerunReportModule('apps','permissions-enum')">Rerun Apps/Permissions</button><button onclick="rerunReportModule('devices','devices')">Rerun Devices</button><button onclick="rerunReportModule('conditionalAccess','conditional-access-policies')">Rerun Conditional Access</button><button onclick="rerunReportModule('m365','sharepoint-discovered-site-urls')">Rerun M365</button><button onclick="rerunReportModule('arm','arm-subscriptions')">Rerun ARM</button><button onclick="rerunReportModule('correlator','attack-paths')">Rerun Correlation</button></div><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
+<section class="card"><div class="splitbar"><h2>Live Report</h2><div><button class="primary" onclick="startFindingDiscovery()">Discover Findings From Existing Evidence</button><button onclick="reloadReport()">Refresh Report Frame</button><button onclick="regenerateReport()">Regenerate From Evidence</button></div></div><p class="tokenMeta">Current run: <span id="reportRunPath"></span></p><div class="hint"><h3>Report Finding Producers</h3><button onclick="rerunReportModule('tenant','domains')">Rerun Tenant</button><button onclick="rerunReportModule('users','users')">Rerun Users</button><button onclick="rerunReportModule('roles','role-members')">Rerun Roles/PIM</button><button onclick="rerunReportModule('groups','groups')">Rerun Groups</button><button onclick="rerunReportModule('apps','permissions-enum')">Rerun Apps/Permissions</button><button onclick="rerunReportModule('devices','devices')">Rerun Devices</button><button onclick="rerunReportModule('conditionalAccess','conditional-access-policies')">Rerun Conditional Access</button><button onclick="rerunReportModule('m365','sharepoint-discovered-site-urls')">Rerun M365</button><button onclick="rerunReportModule('arm','arm-subscriptions')">Rerun ARM</button><button onclick="rerunReportModule('correlator','attack-paths')">Rerun Correlation</button></div><div id="reportFrameWrap"><iframe id="reportFrame" class="reportFrame" src="/api/report"></iframe></div></section>
 </div>
 <div id="attacks" class="panel">
 <div class="grid">
@@ -2251,6 +2391,16 @@ function Route {
     param($Request)
     $Response = $Request
     $path = $Request.Url.AbsolutePath
+    if ($Request.HttpMethod -eq 'GET' -and $path -eq '/favicon.ico') {
+        $assetPath = Join-Path $PSScriptRoot 'assets\favicon.ico'
+        if (Test-Path -LiteralPath $assetPath) { Send-BinaryResponse $Response ([IO.File]::ReadAllBytes($assetPath)) 'image/x-icon'; return }
+        Send-Response $Response 'Not found' 'text/plain' 404; return
+    }
+    if ($Request.HttpMethod -eq 'GET' -and $path -eq '/assets/logo.png') {
+        $assetPath = Join-Path $PSScriptRoot 'assets\logo.png'
+        if (Test-Path -LiteralPath $assetPath) { Send-BinaryResponse $Response ([IO.File]::ReadAllBytes($assetPath)) 'image/png'; return }
+        Send-Response $Response 'Not found' 'text/plain' 404; return
+    }
     if ($Request.HttpMethod -eq 'GET' -and $path -eq '/') { Send-Response $Response (Get-ConsoleHtml) 'text/html'; return }
     if ($Request.HttpMethod -eq 'GET' -and $path -eq '/api/state') { Send-Response $Response (ConvertTo-JsonText (Get-State)); return }
     if ($Request.HttpMethod -eq 'GET' -and $path -eq '/api/options') { Send-Response $Response (ConvertTo-JsonText (Get-ConsoleOptions)); return }
